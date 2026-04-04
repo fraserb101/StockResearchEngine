@@ -1216,7 +1216,90 @@ def parse_args():
                         help="Force refresh all stocks")
     parser.add_argument("--delay", type=float, default=2.0,
                         help="Delay between API calls in seconds (default: 2)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Generate reports with mock data (no API key needed)")
     return parser.parse_args()
+
+
+def generate_mock_research(stock, action, is_portfolio):
+    """Generate realistic mock research text for --dry-run mode."""
+    name = stock["name"]
+    sector = stock["sector"]
+    style = stock["stockrank_style"]
+    qv = stock["qv_rank"]
+    quality = stock["quality_rank"]
+    value = stock["value_rank"]
+    risk = stock["risk_rating"]
+    mkt_cap = stock["mkt_cap"]
+    currency = "GBP" if stock["flag"] == "gb" else "USD"
+
+    if action == "none":
+        return f"{name} remains on the radar with a {style} profile. No material developments."
+
+    if action == "condensed":
+        return (
+            f"{name} carries a QV Rank of {qv}, reflecting a Quality score of {quality} "
+            f"and Value score of {value}. The {sector} company trades at a market capitalisation "
+            f"of {mkt_cap}m {currency} and holds a {risk} risk rating. "
+            f"The ranks appear broadly justified by the company's fundamentals, with no obvious "
+            f"distortions from one-off events. The bull case rests on potential margin expansion "
+            f"as the business scales, combined with what looks like genuine undervaluation relative "
+            f"to quality peers in the {sector} space. However, at this stage the catalysts for a "
+            f"re-rating remain uncertain, and the stock warrants monitoring rather than immediate action. "
+            f"WATCH — ranks are solid but a clearer catalyst is needed before committing capital."
+        )
+
+    # Full research
+    if is_portfolio:
+        rec = "HOLD"
+        rec_text = (
+            f"HOLD. {name} continues to justify its place in the portfolio. The Quality Rank of "
+            f"{quality} reflects genuine operational strength, and the Value Rank of {value} suggests "
+            f"the market has not yet fully priced in the company's quality. The {style} classification "
+            f"and overall QV Rank of {qv} reinforce the investment thesis. No deterioration in ranks "
+            f"that would trigger a sell signal."
+        )
+    else:
+        rec = "BUY" if qv >= 90 else "WATCH"
+        if rec == "BUY":
+            rec_text = (
+                f"BUY. The QV Rank of {qv} represents a compelling entry signal. Quality and Value "
+                f"are both elevated, Momentum has not yet caught up, and the narrative supports a "
+                f"credible re-rating story. The {risk} risk profile is acceptable given the upside potential."
+            )
+        else:
+            rec_text = (
+                f"WATCH. The QV Rank of {qv} is encouraging but not yet compelling enough for immediate "
+                f"action. Quality at {quality} is solid, but the Value score of {value} suggests the market "
+                f"may already be partially pricing in the quality. Monitor for further rank improvement."
+            )
+
+    return (
+        f"The Quality Rank of {quality} and Value Rank of {value} for {name} appear well-supported by "
+        f"the company's underlying fundamentals. Operating in the {sector} sector with a market cap of "
+        f"{mkt_cap}m {currency}, the company has demonstrated consistent execution. The {style} "
+        f"classification from Stockopedia aligns with what we see in the financials — this is a business "
+        f"where quality metrics are genuinely strong rather than artificially inflated by one-off items.\n\n"
+        f"Over the past three to six months, {name} has continued to execute against its strategic plan. "
+        f"Recent trading updates have been broadly in line with expectations, with management maintaining "
+        f"guidance. The {sector} sector has seen mixed conditions, but {name} has navigated these "
+        f"effectively, suggesting operational resilience that justifies the elevated Quality Rank.\n\n"
+        f"The multibagger case for {name} rests on three pillars. First, revenue growth potential looks "
+        f"credible as the company expands its addressable market. Second, there is a realistic path to "
+        f"margin expansion through operational leverage as fixed costs are spread across a growing revenue "
+        f"base. Third, the valuation remains undemanding relative to quality — the market appears to be "
+        f"applying a discount that does not reflect the company's true earnings power.\n\n"
+        f"The bear case centres on two specific risks. The {sector} sector faces potential headwinds from "
+        f"regulatory changes that could compress margins. Additionally, the company's relatively modest "
+        f"market capitalisation of {mkt_cap}m {currency} means liquidity risk in a downturn is real — "
+        f"the bid-offer spread can widen significantly during periods of market stress.\n\n"
+        f"From an ESG perspective, {name} operates within the norms for its {sector} peer group. "
+        f"No material controversies have emerged recently. Governance appears adequate with no red flags "
+        f"in board composition or executive compensation structures.\n\n"
+        f"No financial health red flags are apparent. The balance sheet looks clean with manageable debt "
+        f"levels and adequate cash flow generation. No recent dilution or unusual financing activity.\n\n"
+        f"{rec_text}"
+    )
 
 
 def main():
@@ -1227,32 +1310,44 @@ def main():
     # Check Python version
     print(f"Python {sys.version_info.major}.{sys.version_info.minor}+ check: OK")
 
-    # Check API key
+    args = parse_args()
+    dry_run = args.dry_run
+
+    # Check API key (skip for dry run)
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    if not api_key and not dry_run:
         sys.exit("Error: ANTHROPIC_API_KEY environment variable is not set.\n"
                  "Set it with: export ANTHROPIC_API_KEY='your-key-here'")
 
-    args = parse_args()
+    if dry_run:
+        print("MODE: Dry run (mock data, no API calls)")
 
     # Ensure directories exist
+    print("Creating directories...", end=" ", flush=True)
     ensure_dirs()
+    print("OK")
 
     # Load and validate CSVs
+    print("Validating CSVs...", end=" ", flush=True)
     portfolio_df, watchlist_df, unique_stocks = load_stocks(args.portfolio, args.watchlist)
 
     # Derive screen name from watchlist filename
     screen_name = derive_screen_name(args.watchlist)
+    print(f"Screen name: {screen_name}")
 
     # Load history
+    print("Loading rank history...", end=" ", flush=True)
     history = load_history()
     prev_history = json.loads(json.dumps(history)) if history else None  # deep copy
     is_first_run = len(history) == 0
+    print(f"{'No history found (first run)' if is_first_run else f'{len(history)} stocks in history'}")
 
     print(f"Timezone: Europe/London (all internal timestamps in UTC)")
 
     # Assign tiers
+    print("Assigning watchlist tiers...", end=" ", flush=True)
     tiers = assign_tiers(unique_stocks, history, args.top, is_first_run)
+    print("done")
 
     # Print tier breakdown
     t1_count = sum(1 for t in tiers.values() if t == 1)
@@ -1275,16 +1370,26 @@ def main():
     print(f"  Tier 3 (everything else):            {t3_count} stocks")
 
     # Build run plan
+    print("\nBuilding run plan...", end=" ", flush=True)
     counts, action_map = build_run_plan(
         unique_stocks, tiers, history, is_first_run,
         args.refresh, args.refresh_all
     )
+    print("done")
+    print(f"  Full research:     {counts['full_research']}")
+    print(f"  Condensed:         {counts['condensed']}")
+    print(f"  Lightweight update:{counts['updates']}")
+    print(f"  No API call:       {counts['no_api']}")
 
-    # Initialize API client
-    client = anthropic.Anthropic(api_key=api_key)
+    # Initialize API client (skip for dry run)
+    client = None
+    if not dry_run:
+        print("\nInitialising API client...", end=" ", flush=True)
+        client = anthropic.Anthropic(api_key=api_key)
+        print("OK")
 
-    # Trial mode
-    if not args.skip_trial:
+    # Trial mode (skip for dry run)
+    if not dry_run and not args.skip_trial:
         trial_usage, trial_count = run_trial(
             client, unique_stocks, tiers, history, is_first_run, args.delay
         )
@@ -1297,8 +1402,6 @@ def main():
 
         portfolio_full = sum(1 for k, s in unique_stocks.items()
                             if s["in_portfolio"] and action_map.get(k) == "full")
-        portfolio_update = sum(1 for k, s in unique_stocks.items()
-                              if s["in_portfolio"] and action_map.get(k) == "update")
 
         print(f"\nFull run breakdown:")
         print(f"  Portfolio full research:    {portfolio_full} stocks")
@@ -1320,7 +1423,11 @@ def main():
             print("Aborted.")
             return
 
-    # Full run
+    # ── Full run ────────────────────────────────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print(f"{'DRY RUN' if dry_run else 'FULL RUN'} — Processing {len(unique_stocks)} unique stocks")
+    print(f"{'=' * 60}\n")
+
     research_results = {}
     total_usage = {"input_tokens": 0, "output_tokens": 0, "search_requests": 0}
     succeeded = 0
@@ -1366,30 +1473,48 @@ def main():
         else:
             tier_label = "cache"
 
-        print(f"[{i+1}/{total_to_process}]  {ticker:<6s}({name}, {exchange})  [{tier_label}]")
+        print(f"[{i+1}/{total_to_process}]  {ticker:<6s}({name}, {exchange})  [{tier_label}]", end="", flush=True)
 
         if action == "none":
             cached = read_cache(stock)
             if cached:
                 research_results[key] = cached
+                print("  -> served from cache")
+            else:
+                print("  -> no cache (Tier 3, skipped)")
+            succeeded += 1
+            continue
+
+        if dry_run:
+            # Generate mock research
+            text = generate_mock_research(stock, action, is_portfolio)
+            research_results[key] = text
+            # Write to cache for dry run too
+            timestamp = utc_now().strftime("%Y-%m-%d")
+            header = f"# {name} ({ticker} — {exchange})\n## Research — {timestamp} UTC\n\n"
+            write_cache(stock, header + text)
+            print(f"  -> mock {action} research generated")
             succeeded += 1
             continue
 
         prev = get_previous_snapshot(history, stock)
 
+        print(f"  -> calling API...", end="", flush=True)
         try:
             text, usage = research_stock(
                 client, stock, action, prev,
                 is_first_run, is_portfolio, args.delay
             )
             research_results[key] = text
+            cost = calculate_cost(usage)
             for k in total_usage:
                 total_usage[k] += usage[k]
             succeeded += 1
+            print(f" done (${cost:.3f}, {usage['output_tokens']} tokens, {usage['search_requests']} searches)")
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             log_error(ticker, err_msg)
-            print(f"  ERROR: {err_msg}")
+            print(f" FAILED: {err_msg}")
             failed += 1
             failed_tickers.append(ticker)
             research_results[key] = ""
@@ -1399,11 +1524,14 @@ def main():
             time.sleep(args.delay)
 
     # Update history with new snapshots
+    print(f"\nSaving rank snapshots to history...", end=" ", flush=True)
     for key, stock in unique_stocks.items():
         add_snapshot(history, stock)
     save_history(history)
+    print("done")
 
     # Generate reports
+    print("Generating reports...", end=" ", flush=True)
     output_files = generate_output_filenames()
 
     generate_summary_file(
@@ -1418,19 +1546,25 @@ def main():
         output_files["watchlist"], unique_stocks, tiers, research_results,
         history, is_first_run, screen_name, prev_history
     )
+    print("done")
 
     # Cleanup old outputs
     cleanup_old_outputs()
 
     # Final summary
     total_cost = calculate_cost(total_usage)
-    print(f"\nRun complete. {succeeded} succeeded, {failed} failed.")
+    print(f"\n{'=' * 60}")
+    print(f"Run complete. {succeeded} succeeded, {failed} failed.")
     if failed_tickers:
         print(f"Failed: {', '.join(failed_tickers)} — see {ERROR_LOG}")
-    print(f"Total cost: ${total_cost:.2f}")
+    if not dry_run:
+        print(f"Total cost: ${total_cost:.2f}")
+    else:
+        print("Total cost: $0.00 (dry run)")
     print(f"\nReports saved:")
     for label, path in output_files.items():
         print(f"  {path}")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
