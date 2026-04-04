@@ -680,7 +680,7 @@ def estimate_full_run_cost(trial_usage, trial_stock_count, run_plan):
     return cost
 
 
-def build_run_plan(unique_stocks, tiers, history, is_first_run, refresh_ticker, refresh_all):
+def build_run_plan(unique_stocks, tiers, history, is_first_run, refresh_ticker, refresh_all, tier1_only=False):
     """Build a plan of what research actions are needed. Returns categorised counts and action map."""
     action_map = {}  # key -> action
     counts = {
@@ -709,7 +709,10 @@ def build_run_plan(unique_stocks, tiers, history, is_first_run, refresh_ticker, 
 
         if is_watchlist:
             tier = tiers.get(key, 3)
-            if force:
+            # In tier1-only mode, skip API calls for Tier 2/3 watchlist-only stocks
+            if tier1_only and tier > 1 and not is_portfolio:
+                action = "none"
+            elif force:
                 action = "full" if tier <= 1 else ("condensed" if tier == 2 else "none")
             else:
                 action = determine_research_action(stock, tier, force_refresh=False)
@@ -1218,6 +1221,8 @@ def parse_args():
                         help="Delay between API calls in seconds (default: 2)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Generate reports with mock data (no API key needed)")
+    parser.add_argument("--tier1-only", action="store_true",
+                        help="Only research portfolio + Tier 1 watchlist stocks (skip Tier 2/3 API calls)")
     return parser.parse_args()
 
 
@@ -1387,7 +1392,7 @@ def main():
     print("\nBuilding run plan...", end=" ", flush=True)
     counts, action_map = build_run_plan(
         unique_stocks, tiers, history, is_first_run,
-        args.refresh, args.refresh_all
+        args.refresh, args.refresh_all, tier1_only=args.tier1_only
     )
     print("done")
     print(f"  Full research:     {counts['full_research']}")
