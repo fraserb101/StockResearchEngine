@@ -601,7 +601,7 @@ def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searc
 
         except anthropic.RateLimitError as e:
             if attempt < max_retries - 1:
-                wait_time = 30 * (attempt + 1)  # 30s, 60s, 90s, 120s
+                wait_time = 60 * (attempt + 1)  # 60s, 120s, 180s, 240s
                 print(f" rate limited, waiting {wait_time}s...", end="", flush=True)
                 time.sleep(wait_time)
             else:
@@ -1228,8 +1228,8 @@ def parse_args():
                         help="Force refresh a single stock by ticker")
     parser.add_argument("--refresh-all", action="store_true",
                         help="Force refresh all stocks")
-    parser.add_argument("--delay", type=float, default=30.0,
-                        help="Delay between API calls in seconds (default: 30)")
+    parser.add_argument("--delay", type=float, default=60.0,
+                        help="Delay between API calls in seconds (default: 60)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Generate reports with mock data (no API key needed)")
     parser.add_argument("--tier1-only", action="store_true",
