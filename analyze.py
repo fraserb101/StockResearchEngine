@@ -1313,11 +1313,25 @@ def main():
     args = parse_args()
     dry_run = args.dry_run
 
-    # Check API key (skip for dry run)
+    # Check API key: try environment variable first, then .env file
     api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        env_file = BASE_DIR / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("ANTHROPIC_API_KEY="):
+                    api_key = line.split("=", 1)[1].strip().strip("'\"")
+                    break
     if not api_key and not dry_run:
-        sys.exit("Error: ANTHROPIC_API_KEY environment variable is not set.\n"
-                 "Set it with: export ANTHROPIC_API_KEY='your-key-here'")
+        sys.exit(
+            "Error: Anthropic API key not found.\n\n"
+            "Option 1 — Create a .env file in the project folder:\n"
+            f"  {BASE_DIR / '.env'}\n"
+            "  with the line: ANTHROPIC_API_KEY=sk-ant-your-key-here\n\n"
+            "Option 2 — Set an environment variable:\n"
+            "  export ANTHROPIC_API_KEY='sk-ant-your-key-here'"
+        )
 
     if dry_run:
         print("MODE: Dry run (mock data, no API calls)")
