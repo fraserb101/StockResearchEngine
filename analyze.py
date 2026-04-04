@@ -563,38 +563,49 @@ Write ONE concise paragraph covering only material changes since the last resear
 
 
 def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searches):
-    """Make a single research API call with web search. Returns (text, usage_dict)."""
+    """Make a single research API call with web search. Retries on rate limit with backoff."""
     tools = [{
         "type": WEB_SEARCH_TOOL_TYPE,
         "name": "web_search",
         "max_uses": max_searches,
     }]
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-        tools=tools,
-    )
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                tools=tools,
+            )
 
-    # Extract text from response
-    text_parts = []
-    for block in response.content:
-        if hasattr(block, "text"):
-            text_parts.append(block.text)
+            # Extract text from response
+            text_parts = []
+            for block in response.content:
+                if hasattr(block, "text"):
+                    text_parts.append(block.text)
 
-    text = "\n".join(text_parts)
+            text = "\n".join(text_parts)
 
-    usage = {
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
-        "search_requests": 0,
-    }
-    if response.usage.server_tool_use:
-        usage["search_requests"] = response.usage.server_tool_use.web_search_requests
+            usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "search_requests": 0,
+            }
+            if response.usage.server_tool_use:
+                usage["search_requests"] = response.usage.server_tool_use.web_search_requests
 
-    return text, usage
+            return text, usage
+
+        except anthropic.RateLimitError as e:
+            if attempt < max_retries - 1:
+                wait_time = 30 * (attempt + 1)  # 30s, 60s, 90s, 120s
+                print(f" rate limited, waiting {wait_time}s...", end="", flush=True)
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 def calculate_cost(usage):
@@ -1217,8 +1228,8 @@ def parse_args():
                         help="Force refresh a single stock by ticker")
     parser.add_argument("--refresh-all", action="store_true",
                         help="Force refresh all stocks")
-    parser.add_argument("--delay", type=float, default=2.0,
-                        help="Delay between API calls in seconds (default: 2)")
+    parser.add_argument("--delay", type=float, default=30.0,
+                        help="Delay between API calls in seconds (default: 30)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Generate reports with mock data (no API key needed)")
     parser.add_argument("--tier1-only", action="store_true",
