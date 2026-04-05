@@ -430,6 +430,7 @@ def call_api(client, system, user, max_tokens, use_search=False):
             "type": WEB_SEARCH_TOOL,
             "name": "web_search",
             "max_uses": 1,
+            "allowed_callers": ["direct"],
         }]
 
     for attempt in range(5):
