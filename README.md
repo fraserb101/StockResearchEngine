@@ -1,24 +1,22 @@
-# Stock Portfolio & Watchlist Analyzer
+# Stock Research Engine
 
-A command-line Python tool that takes CSV exports from Stockopedia and uses AI-powered research to generate actionable hold/sell recommendations for existing holdings, and ranked buy candidates from a screened watchlist.
+A daily stock research tool for UK investors. Takes a Stockopedia CSV export, runs three-pass AI analysis on every stock using Claude Haiku, and outputs a single Markdown report for NotebookLM.
 
 ## System Requirements
 
 - Python 3.10+
-- An Anthropic API key with access to `claude-sonnet-4-6`
+- An Anthropic API key
 
 ## Setup
-
-1. Clone the repository and install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Set your Anthropic API key:
+Create a `.env` file in the project folder:
 
-```bash
-export ANTHROPIC_API_KEY='your-key-here'
+```
+ANTHROPIC_API_KEY=sk-ant-your-key-here
 ```
 
 ## Usage
@@ -26,81 +24,137 @@ export ANTHROPIC_API_KEY='your-key-here'
 ### Standard daily run
 
 ```bash
-python analyze.py --portfolio fb_2026_folio_stockopedia.csv --watchlist super_contrarians_page_1.csv
+python analyze.py --stocks my_stocks.csv
 ```
 
 ### CLI Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--portfolio` | (required) | Path to portfolio CSV from Stockopedia |
-| `--watchlist` | (required) | Path to watchlist CSV from Stockopedia |
-| `--top N` | 5 | Number of top QV rank improvers for Tier 1 full research |
-| `--skip-trial` | off | Skip trial mode for repeat same-day runs |
-| `--max-cost N` | 2.00 | Maximum cost cap in USD (hard limit, cannot be overridden) |
-| `--refresh TICKER` | none | Force refresh research for a single stock |
-| `--refresh-all` | off | Force refresh all stocks |
-| `--delay N` | 2 | Delay between API calls in seconds |
+| `--stocks` | (required) | Path to Stockopedia CSV export |
+| `--top N` | 5 | Number of Tier 1 top QV movers (default 5) |
+| `--refresh TICKER` | none | Force full three-pass refresh for one stock |
+| `--refresh-all` | off | Force full three-pass refresh for every stock |
+| `--max-cost N` | 2.00 | Hard cost cap in USD |
+| `--skip-trial` | off | Skip cost confirmation prompt |
+| `--delay N` | 2 | Seconds between API calls |
+| `--dry-run` | off | Generate report with mock data (no API calls, no cost) |
 
 ### Examples
 
 ```bash
-# Control how many stocks get full research (default 5)
-python analyze.py --portfolio portfolio.csv --watchlist watchlist.csv --top 3
+# Standard run
+python analyze.py --stocks my_stocks.csv
 
-# Skip trial mode for repeat same-day runs
-python analyze.py --portfolio portfolio.csv --watchlist watchlist.csv --skip-trial
+# Change Tier 1 size
+python analyze.py --stocks my_stocks.csv --top 3
+
+# Force refresh a single stock
+python analyze.py --stocks my_stocks.csv --refresh ING
+
+# Force refresh all stocks
+python analyze.py --stocks my_stocks.csv --refresh-all
 
 # Set cost cap
-python analyze.py --portfolio portfolio.csv --watchlist watchlist.csv --max-cost 3.00
+python analyze.py --stocks my_stocks.csv --max-cost 1.00
 
-# Refresh a single stock
-python analyze.py --portfolio portfolio.csv --watchlist watchlist.csv --refresh ING
-
-# Refresh all stocks
-python analyze.py --portfolio portfolio.csv --watchlist watchlist.csv --refresh-all
+# Skip confirmation for repeat runs
+python analyze.py --stocks my_stocks.csv --skip-trial
 
 # Custom delay between API calls
-python analyze.py --portfolio portfolio.csv --watchlist watchlist.csv --delay 3
+python analyze.py --stocks my_stocks.csv --delay 3
+
+# Dry run to validate CSV with no API cost
+python analyze.py --stocks my_stocks.csv --dry-run
 ```
 
 ## Typical Daily Workflow
 
-1. Download portfolio and watchlist CSVs from Stockopedia
-2. Run the tool: `python analyze.py --portfolio portfolio.csv --watchlist watchlist.csv`
-3. Review "Today's Rank Movers" in the summary file
-4. Upload the three output files to NotebookLM
-5. Consume as podcast, slides, or Q&A
+1. Export your stock list from Stockopedia as a CSV
+2. Dry run to validate the CSV: `python analyze.py --stocks my_stocks.csv --dry-run`
+3. Real run: `python analyze.py --stocks my_stocks.csv`
+4. Review the output file in `/output/`
+5. Upload to NotebookLM for podcast or Q&A
 
-## Output Files
+## Research Process — Three Passes Per Stock
 
-Each run generates three Markdown files in the `/output/` directory:
+**Pass 1 — Haiku knowledge pass (no web search)**
+Uses `claude-haiku-4-5-20251001` without web search. Fills in the six-element analysis from training knowledge. Flags any sections where confidence is low.
 
-- **`_summary.md`** — Morning scan file. Today's rank movers, portfolio flags, executive summary. Scannable in 60 seconds.
-- **`_portfolio.md`** — Full research write-ups for every held stock with Hold/Sell recommendations.
-- **`_watchlist.md`** — Tiered research: Tier 1 (full write-ups for top QV movers), Tier 2 (condensed for strong/stable), Tier 3 (one-liners from cache).
+**Pass 2 — Targeted web search (conditional)**
+Only runs if Pass 1 flagged gaps in sections 1, 2, or 3 (Rank Sense-Check, Current Narrative, Multibagger Potential). Uses one targeted web search for the most recent earnings or trading update. Skipped if Pass 1 produced good coverage — saving cost.
 
-Last 10 runs are retained automatically.
+**Pass 3 — Latest Updates (always runs)**
+Always runs for every stock using one web search targeted at official announcements:
+- GB stocks: RNS regulatory news, trading updates, director dealings, results
+- US stocks: SEC filings, official press releases
+
+## Output Structure
+
+Each run generates a single file: `YYYY-MM-DD_HHmm_analysis.md` in `/output/`.
+
+```
+# Stock Analysis Report — [Date] [Time]
+
+## Summary
+[Overview of Tier 1 movers and overall read on the batch]
+
+---
+
+## Tier 1 — Top QV Rank Movers
+[Top 5 stocks by QV rank improvement since last run]
+
+### Company Name (TICKER — Exchange) — BUY / WATCH / SELL
+#### QV: prev→current (+delta) | Quality: X | Value: X | Momentum: X | Style
+
+[Eight-section write-up: Rank Sense-Check, Current Narrative, Multibagger Potential,
+Bear Case, ESG, Financial Health Red Flags, Latest Updates, Final Assessment]
+
+---
+
+## Remaining Stocks — By QV Rank
+[All other stocks ordered by absolute QV rank descending]
+```
+
+All recommendations are **Buy**, **Watch**, or **Sell** — no other labels.
+
+The last 10 output files are retained automatically.
+
+## Cache Behaviour
+
+- **First time a stock is seen:** all three passes run, result cached in `data/cache/`
+- **Within 30 days:** Pass 3 only (Latest Updates), appended as dated update block
+- **Cache older than 30 days:** full three-pass refresh
+- **`--refresh TICKER`:** force full refresh for one stock
+- **`--refresh-all`:** force full refresh for every stock
+
+Cache files are prefixed by market flag: `gb_TICKER.md`, `us_TICKER.md`.
+
+## Expected CSV Columns
+
+The CSV must contain these columns (exported directly from Stockopedia):
+
+```
+Flag, Ticker, Name, Last Price, Mkt Cap (m GBP), Stock Rank™, Quality Rank,
+Value Rank, Momentum Rank, Momentum Rank Previous Day, QV Rank, VM Rank,
+QM Rank, StockRank Style, Risk Rating, Sector
+```
 
 ## Cost Expectations
 
-- **First run (cold cache):** $3-5 depending on portfolio and watchlist size
-- **Daily runs thereafter:** typically well under $1.00 as most stocks are served from cache and only the top N get full research
+All three passes use `claude-haiku-4-5-20251001` — the most cost-efficient Claude model.
+
+- **Full research per stock:** ~$0.025–0.035 (three passes, up to 2 web searches)
+- **Update-only per stock:** ~$0.012 (Pass 3 only, 1 web search)
+- **Typical daily run (30 stocks, mostly cached):** under $0.50
+- **First run (all full research):** ~$0.75–1.00 for 30 stocks
 - **Default cost cap:** $2.00 (configurable via `--max-cost`)
 
-The tool runs a trial on 2 stocks before every full run to estimate actual cost and asks for confirmation before proceeding.
+The tool prints a cost estimate and prompts `Proceed? (y/n)` before every run unless `--skip-trial` is passed.
 
 ## Data Storage
 
-- `/data/cache/` — One Markdown file per stock, prefixed by market flag (`gb_`, `us_`)
-- `/data/history.json` — Rank snapshots per stock per run (max 10 per stock)
-- `/data/errors.log` — Error log with UTC timestamps
-- `/output/` — Report files, last 10 runs retained
-
-## Three-Tier Watchlist System
-
-- **Tier 1** — Top N stocks by QV rank improvement. Full six-element research.
-- **Tier 2** — Remaining stocks with QV Rank above 85. Condensed research.
-- **Tier 3** — Everything else. One-line summary from cache only. No API call.
-
-Tiers are recalculated from scratch on every run based on the latest rank snapshot.
+- `data/cache/` — One Markdown file per stock, prefixed by market flag
+- `data/history.json` — Rank snapshots per stock per run (max 10 per stock)
+- `data/errors.log` — Error log with UTC timestamps
+- `output/` — Report files, last 10 retained automatically
