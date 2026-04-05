@@ -28,7 +28,8 @@ if sys.version_info < MIN_PYTHON:
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
-MODEL = "claude-sonnet-4-6"
+MODEL_DEFAULT = "claude-haiku-4-5"
+MODEL_SEARCH = "claude-sonnet-4-6"  # Haiku doesn't support web search
 WEB_SEARCH_TOOL_TYPE = "web_search_20260209"
 
 # Token budgets (hard max_tokens on every API call)
@@ -42,9 +43,11 @@ SEARCHES_FULL = 1
 SEARCHES_CONDENSED = 1
 SEARCHES_UPDATE = 1
 
-# Pricing (claude-sonnet-4-6 per token)
-PRICE_INPUT_PER_TOKEN = 3.0 / 1_000_000     # $3 per 1M input tokens
-PRICE_OUTPUT_PER_TOKEN = 15.0 / 1_000_000   # $15 per 1M output tokens
+# Pricing — Haiku default, Sonnet when using web search
+PRICE_INPUT_HAIKU = 0.80 / 1_000_000        # $0.80 per 1M input tokens
+PRICE_OUTPUT_HAIKU = 4.0 / 1_000_000        # $4 per 1M output tokens
+PRICE_INPUT_SONNET = 3.0 / 1_000_000        # $3 per 1M input tokens
+PRICE_OUTPUT_SONNET = 15.0 / 1_000_000      # $15 per 1M output tokens
 PRICE_PER_SEARCH = 10.0 / 1000              # $10 per 1K searches = $0.01 each
 
 # Cache settings
@@ -493,8 +496,6 @@ Previous snapshot ({prev_snapshot['timestamp_utc']}):
 
 {"BASELINE RUN — no previous data available. Rank change tracking begins from next run." if is_first_run else ""}
 
-Search for "{name} {search_suffix}" to find recent news and analysis. Use the full company name in searches, never the ticker alone.
-
 Write a research report covering these six elements in flowing prose (400-500 words total):
 
 1. RANK SENSE-CHECK: Do the Quality and Value ranks hold up against what is actually happening at the company? Are improving ranks justified by real fundamental change, or distorted by a one-off event?
@@ -530,8 +531,6 @@ def build_condensed_research_prompt(stock, prev_snapshot, is_first_run):
 
 {"BASELINE RUN — no previous data available." if is_first_run else ""}
 
-Search for "{name} {search_suffix}" to find recent information.
-
 Write a condensed assessment (~200 words) covering:
 1. RANK SENSE-CHECK: Do the QV ranks match what's happening at the company?
 2. MULTIBAGGER POTENTIAL: Brief bull case — revenue growth, margin expansion, re-rating potential.
@@ -552,8 +551,6 @@ def build_update_prompt(stock, existing_cache):
 
 Current ranks: Quality {stock['quality_rank']} | Value {stock['value_rank']} | QV {stock['qv_rank']} | Style: {stock['stockrank_style']}
 
-Search for "{name} {search_suffix}" for any material recent developments.
-
 Write ONE concise paragraph covering only material changes since the last research. If nothing material has changed, say so in one sentence. Do not repeat background information."""
 
     return system_prompt, user_prompt
@@ -562,24 +559,27 @@ Write ONE concise paragraph covering only material changes since the last resear
 # ─── API Calls ──────────────────────────────────────────────────────────────────
 
 
-def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searches):
-    """Make a single research API call with web search. Retries on rate limit with backoff."""
-    tools = [{
-        "type": WEB_SEARCH_TOOL_TYPE,
-        "name": "web_search",
-        "max_uses": max_searches,
-    }]
+def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searches, use_search=False):
+    """Make a research API call, optionally with web search. Retries on rate limit."""
+    model = MODEL_SEARCH if use_search else MODEL_DEFAULT
+    kwargs = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
+
+    if use_search and max_searches > 0:
+        kwargs["tools"] = [{
+            "type": WEB_SEARCH_TOOL_TYPE,
+            "name": "web_search",
+            "max_uses": max_searches,
+        }]
 
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-                tools=tools,
-            )
+            response = client.messages.create(**kwargs)
 
             # Extract text from response
             text_parts = []
@@ -610,21 +610,29 @@ def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searc
 
 def calculate_cost(usage):
     """Calculate dollar cost from a usage dict."""
+    if usage.get("search_requests", 0) > 0:
+        # Sonnet pricing when web search was used
+        input_price = PRICE_INPUT_SONNET
+        output_price = PRICE_OUTPUT_SONNET
+    else:
+        # Haiku pricing
+        input_price = PRICE_INPUT_HAIKU
+        output_price = PRICE_OUTPUT_HAIKU
     return (
-        usage["input_tokens"] * PRICE_INPUT_PER_TOKEN
-        + usage["output_tokens"] * PRICE_OUTPUT_PER_TOKEN
-        + usage["search_requests"] * PRICE_PER_SEARCH
+        usage["input_tokens"] * input_price
+        + usage["output_tokens"] * output_price
+        + usage.get("search_requests", 0) * PRICE_PER_SEARCH
     )
 
 
-def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfolio, delay):
+def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfolio, delay, use_search=False):
     """Research a single stock. Returns (research_text, usage_dict) or raises."""
     if action == "full":
         system_prompt, user_prompt = build_full_research_prompt(
             stock, prev_snapshot, is_first_run, is_portfolio
         )
         text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_FULL, SEARCHES_FULL)
+                                         TOKENS_FULL, SEARCHES_FULL, use_search=use_search)
         # Write to cache
         timestamp = utc_now().strftime("%Y-%m-%d")
         header = f"# {stock['name']} ({stock['ticker']} — {get_exchange_label(stock['flag'])})\n## Research — {timestamp} UTC\n\n"
@@ -641,7 +649,7 @@ def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfo
             stock, prev_snapshot, is_first_run
         )
         text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_CONDENSED, SEARCHES_CONDENSED)
+                                         TOKENS_CONDENSED, SEARCHES_CONDENSED, use_search=use_search)
         timestamp = utc_now().strftime("%Y-%m-%d")
         existing = read_cache(stock)
         if existing:
@@ -655,7 +663,7 @@ def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfo
         existing_cache = read_cache(stock) or ""
         system_prompt, user_prompt = build_update_prompt(stock, existing_cache)
         text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_UPDATE, SEARCHES_UPDATE)
+                                         TOKENS_UPDATE, SEARCHES_UPDATE, use_search=use_search)
         timestamp = utc_now().strftime("%Y-%m-%d")
         append_cache(stock, f"### Update — {timestamp} UTC\n{text}")
         return text, usage
@@ -759,7 +767,7 @@ def _action_count_key(action):
     }.get(action, "no_api")
 
 
-def run_trial(client, unique_stocks, tiers, history, is_first_run, delay):
+def run_trial(client, unique_stocks, tiers, history, is_first_run, delay, use_search=False):
     """Run trial on 2 stocks. Returns total usage dict."""
     total_usage = {"input_tokens": 0, "output_tokens": 0, "search_requests": 0}
 
@@ -802,7 +810,8 @@ def run_trial(client, unique_stocks, tiers, history, is_first_run, delay):
         prev = get_previous_snapshot(history, stock)
         try:
             text, usage = research_stock(client, stock, action, prev,
-                                         is_first_run, is_portfolio, delay)
+                                         is_first_run, is_portfolio, delay,
+                                         use_search=use_search)
             for k in total_usage:
                 total_usage[k] += usage[k]
         except Exception as e:
@@ -1228,12 +1237,14 @@ def parse_args():
                         help="Force refresh a single stock by ticker")
     parser.add_argument("--refresh-all", action="store_true",
                         help="Force refresh all stocks")
-    parser.add_argument("--delay", type=float, default=10.0,
-                        help="Delay between API calls in seconds (default: 10)")
+    parser.add_argument("--delay", type=float, default=2.0,
+                        help="Delay between API calls in seconds (default: 2)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Generate reports with mock data (no API key needed)")
     parser.add_argument("--tier1-only", action="store_true",
                         help="Only research portfolio + Tier 1 watchlist stocks (skip Tier 2/3 API calls)")
+    parser.add_argument("--with-search", action="store_true",
+                        help="Enable live web search (uses Sonnet, slower and costlier)")
     return parser.parse_args()
 
 
@@ -1533,7 +1544,8 @@ def main():
         try:
             text, usage = research_stock(
                 client, stock, action, prev,
-                is_first_run, is_portfolio, args.delay
+                is_first_run, is_portfolio, args.delay,
+                use_search=args.with_search
             )
             research_results[key] = text
             cost = calculate_cost(usage)
