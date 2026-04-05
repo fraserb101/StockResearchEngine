@@ -3,7 +3,7 @@ __pycache__/
 data/cache/
 data/history.json
 data/errors.log
-output/*.md
+# output/*.md
 test_data/
 *.csv
 .env
