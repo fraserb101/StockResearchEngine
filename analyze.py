@@ -28,7 +28,8 @@ if sys.version_info < MIN_PYTHON:
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
-MODEL = "claude-sonnet-4-6"
+MODEL_DEFAULT = "claude-haiku-4-5"           # Fast, cheap — used for all research by default
+MODEL_SEARCH = "claude-sonnet-4-6"           # Only used when --with-search is enabled
 WEB_SEARCH_TOOL_TYPE = "web_search_20260209"
 
 # Token budgets (hard max_tokens on every API call)
@@ -37,14 +38,17 @@ TOKENS_CONDENSED = 600
 TOKENS_UPDATE = 400
 TOKENS_SUMMARY = 600
 
-# Web search limits per API call
-SEARCHES_FULL = 3
-SEARCHES_CONDENSED = 2
-SEARCHES_UPDATE = 1
+# Web search limits per API call (only when --with-search)
+SEARCHES_FULL = 1
+SEARCHES_CONDENSED = 1
+SEARCHES_UPDATE = 0
 
-# Pricing (claude-sonnet-4-6 per token)
-PRICE_INPUT_PER_TOKEN = 3.0 / 1_000_000     # $3 per 1M input tokens
-PRICE_OUTPUT_PER_TOKEN = 15.0 / 1_000_000   # $15 per 1M output tokens
+# Pricing — Haiku (default)
+PRICE_INPUT_HAIKU = 0.80 / 1_000_000        # $0.80 per 1M input tokens
+PRICE_OUTPUT_HAIKU = 4.0 / 1_000_000        # $4 per 1M output tokens
+# Pricing — Sonnet (with search)
+PRICE_INPUT_SONNET = 3.0 / 1_000_000        # $3 per 1M input tokens
+PRICE_OUTPUT_SONNET = 15.0 / 1_000_000      # $15 per 1M output tokens
 PRICE_PER_SEARCH = 10.0 / 1000              # $10 per 1K searches = $0.01 each
 
 # Cache settings
@@ -562,21 +566,23 @@ Write ONE concise paragraph covering only material changes since the last resear
 # ─── API Calls ──────────────────────────────────────────────────────────────────
 
 
-def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searches):
-    """Make a single research API call with web search. Returns (text, usage_dict)."""
-    tools = [{
-        "type": WEB_SEARCH_TOOL_TYPE,
-        "name": "web_search",
-        "max_uses": max_searches,
-    }]
+def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searches, use_search=False):
+    """Make a single research API call. Uses Haiku by default; Sonnet + web search when use_search=True."""
+    kwargs = {
+        "model": MODEL_SEARCH if use_search else MODEL_DEFAULT,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-        tools=tools,
-    )
+    if use_search and max_searches > 0:
+        kwargs["tools"] = [{
+            "type": WEB_SEARCH_TOOL_TYPE,
+            "name": "web_search",
+            "max_uses": max_searches,
+        }]
+
+    response = client.messages.create(**kwargs)
 
     # Extract text from response
     text_parts = []
@@ -598,22 +604,27 @@ def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searc
 
 
 def calculate_cost(usage):
-    """Calculate dollar cost from a usage dict."""
+    """Calculate dollar cost from a usage dict. Uses Sonnet pricing if search was used, Haiku otherwise."""
+    if usage.get("search_requests", 0) > 0:
+        return (
+            usage["input_tokens"] * PRICE_INPUT_SONNET
+            + usage["output_tokens"] * PRICE_OUTPUT_SONNET
+            + usage["search_requests"] * PRICE_PER_SEARCH
+        )
     return (
-        usage["input_tokens"] * PRICE_INPUT_PER_TOKEN
-        + usage["output_tokens"] * PRICE_OUTPUT_PER_TOKEN
-        + usage["search_requests"] * PRICE_PER_SEARCH
+        usage["input_tokens"] * PRICE_INPUT_HAIKU
+        + usage["output_tokens"] * PRICE_OUTPUT_HAIKU
     )
 
 
-def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfolio, delay):
+def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfolio, delay, use_search=False):
     """Research a single stock. Returns (research_text, usage_dict) or raises."""
     if action == "full":
         system_prompt, user_prompt = build_full_research_prompt(
             stock, prev_snapshot, is_first_run, is_portfolio
         )
         text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_FULL, SEARCHES_FULL)
+                                         TOKENS_FULL, SEARCHES_FULL, use_search=use_search)
         # Write to cache
         timestamp = utc_now().strftime("%Y-%m-%d")
         header = f"# {stock['name']} ({stock['ticker']} — {get_exchange_label(stock['flag'])})\n## Research — {timestamp} UTC\n\n"
@@ -630,7 +641,7 @@ def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfo
             stock, prev_snapshot, is_first_run
         )
         text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_CONDENSED, SEARCHES_CONDENSED)
+                                         TOKENS_CONDENSED, SEARCHES_CONDENSED, use_search=use_search)
         timestamp = utc_now().strftime("%Y-%m-%d")
         existing = read_cache(stock)
         if existing:
@@ -644,7 +655,7 @@ def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfo
         existing_cache = read_cache(stock) or ""
         system_prompt, user_prompt = build_update_prompt(stock, existing_cache)
         text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_UPDATE, SEARCHES_UPDATE)
+                                         TOKENS_UPDATE, SEARCHES_UPDATE, use_search=use_search)
         timestamp = utc_now().strftime("%Y-%m-%d")
         append_cache(stock, f"### Update — {timestamp} UTC\n{text}")
         return text, usage
@@ -680,7 +691,7 @@ def estimate_full_run_cost(trial_usage, trial_stock_count, run_plan):
     return cost
 
 
-def build_run_plan(unique_stocks, tiers, history, is_first_run, refresh_ticker, refresh_all):
+def build_run_plan(unique_stocks, tiers, history, is_first_run, refresh_ticker, refresh_all, tier1_only=False):
     """Build a plan of what research actions are needed. Returns categorised counts and action map."""
     action_map = {}  # key -> action
     counts = {
@@ -709,6 +720,11 @@ def build_run_plan(unique_stocks, tiers, history, is_first_run, refresh_ticker, 
 
         if is_watchlist:
             tier = tiers.get(key, 3)
+            # In tier1_only mode, skip Tier 2/3 API calls
+            if tier1_only and tier > 1 and key not in action_map:
+                action_map[key] = "none"
+                counts["no_api"] += 1
+                continue
             if force:
                 action = "full" if tier <= 1 else ("condensed" if tier == 2 else "none")
             else:
@@ -745,7 +761,7 @@ def _action_count_key(action):
     }.get(action, "no_api")
 
 
-def run_trial(client, unique_stocks, tiers, history, is_first_run, delay):
+def run_trial(client, unique_stocks, tiers, history, is_first_run, delay, use_search=False):
     """Run trial on 2 stocks. Returns total usage dict."""
     total_usage = {"input_tokens": 0, "output_tokens": 0, "search_requests": 0}
 
@@ -788,7 +804,7 @@ def run_trial(client, unique_stocks, tiers, history, is_first_run, delay):
         prev = get_previous_snapshot(history, stock)
         try:
             text, usage = research_stock(client, stock, action, prev,
-                                         is_first_run, is_portfolio, delay)
+                                         is_first_run, is_portfolio, delay, use_search=use_search)
             for k in total_usage:
                 total_usage[k] += usage[k]
         except Exception as e:
@@ -1244,6 +1260,10 @@ def parse_args():
                         help="Delay between API calls in seconds (default: 2)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Generate reports with mock data (no API key needed)")
+    parser.add_argument("--with-search", action="store_true",
+                        help="Enable web search (uses Sonnet, much more expensive)")
+    parser.add_argument("--tier1-only", action="store_true",
+                        help="Only research portfolio + Tier 1 watchlist stocks")
     return parser.parse_args()
 
 
@@ -1399,7 +1419,7 @@ def main():
     print("\nBuilding run plan...", end=" ", flush=True)
     counts, action_map = build_run_plan(
         unique_stocks, tiers, history, is_first_run,
-        args.refresh, args.refresh_all
+        args.refresh, args.refresh_all, tier1_only=args.tier1_only
     )
     print("done")
     print(f"  Full research:     {counts['full_research']}")
@@ -1417,7 +1437,8 @@ def main():
     # Trial mode (skip for dry run)
     if not dry_run and not args.skip_trial:
         trial_usage, trial_count = run_trial(
-            client, unique_stocks, tiers, history, is_first_run, args.delay
+            client, unique_stocks, tiers, history, is_first_run, args.delay,
+            use_search=args.with_search
         )
         trial_cost = calculate_cost(trial_usage)
 
@@ -1529,7 +1550,8 @@ def main():
         try:
             text, usage = research_stock(
                 client, stock, action, prev,
-                is_first_run, is_portfolio, args.delay
+                is_first_run, is_portfolio, args.delay,
+                use_search=args.with_search
             )
             research_results[key] = text
             cost = calculate_cost(usage)
