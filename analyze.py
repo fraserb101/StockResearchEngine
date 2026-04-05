@@ -250,7 +250,9 @@ def determine_action(stock, force_refresh):
 
 
 def strip_cache_header(cached_text):
-    """Strip the cache file header (# Name, ## Research — date) from cached text."""
+    """Strip the cache file header (# Name, ## Research — date) from cached text.
+    Also removes any <<LOW CONFIDENCE>> markers left by Pass 1.
+    """
     lines = cached_text.split("\n")
     start = 0
     for i, line in enumerate(lines):
@@ -259,7 +261,9 @@ def strip_cache_header(cached_text):
             start = i + 1
         else:
             break
-    return "\n".join(lines[start:]).strip()
+    body = "\n".join(lines[start:]).strip()
+    body = re.sub(r'<<LOW CONFIDENCE>>\s*', '', body)
+    return body
 
 
 # ── Research Prompts ──────────────────────────────────────────────────────────
@@ -474,6 +478,10 @@ def run_full_research(client, stock, prev, is_first_run, delay):
     # Extract PASS2_NEEDED marker and clean text
     pass2_needed = "PASS2_NEEDED: YES" in p1_raw
     pass1_clean = re.sub(r'\nPASS2_NEEDED:.*$', '', p1_raw, flags=re.MULTILINE).strip()
+    # Strip internal artefacts: model-added H1/H2 headers and <<LOW CONFIDENCE>> flags
+    pass1_clean = re.sub(r'^#{1,2} .+\n?', '', pass1_clean, flags=re.MULTILINE)
+    pass1_clean = re.sub(r'<<LOW CONFIDENCE>>\s*', '', pass1_clean)
+    pass1_clean = pass1_clean.strip()
 
     time.sleep(delay)
 
