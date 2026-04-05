@@ -38,8 +38,8 @@ TOKENS_UPDATE = 400
 TOKENS_SUMMARY = 600
 
 # Web search limits per API call
-SEARCHES_FULL = 3
-SEARCHES_CONDENSED = 2
+SEARCHES_FULL = 1
+SEARCHES_CONDENSED = 1
 SEARCHES_UPDATE = 1
 
 # Pricing (claude-sonnet-4-6 per token)
@@ -1228,8 +1228,8 @@ def parse_args():
                         help="Force refresh a single stock by ticker")
     parser.add_argument("--refresh-all", action="store_true",
                         help="Force refresh all stocks")
-    parser.add_argument("--delay", type=float, default=60.0,
-                        help="Delay between API calls in seconds (default: 60)")
+    parser.add_argument("--delay", type=float, default=10.0,
+                        help="Delay between API calls in seconds (default: 10)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Generate reports with mock data (no API key needed)")
     parser.add_argument("--tier1-only", action="store_true",
