@@ -851,9 +851,17 @@ def build_portfolio_stock_section(stock, research_text, prev_snapshot, is_first_
 
     # Determine recommendation from research text
     rec = "HOLD"
-    text_upper = research_text.upper() if research_text else ""
-    if "SELL" in text_upper and "HOLD" not in text_upper:
-        rec = "SELL"
+    if research_text:
+        # Look for explicit recommendation lines like "Recommendation: SELL" or "## RECOMMENDATION: HOLD"
+        rec_match = re.search(r'(?:recommendation|final assessment)[:\s]+\*?\*?(HOLD|SELL)\b', research_text, re.IGNORECASE)
+        if rec_match:
+            rec = rec_match.group(1).upper()
+        else:
+            # Fallback: check if SELL appears in final 20% of text without HOLD nearby
+            text_upper = research_text.upper()
+            tail = text_upper[len(text_upper) * 4 // 5:]
+            if "SELL" in tail and "HOLD" not in tail:
+                rec = "SELL"
 
     lines = [f"### {name} ({ticker} — {exchange}) — {rec}"]
 
@@ -888,11 +896,18 @@ def build_watchlist_tier1_section(stock, research_text, prev_snapshot, is_first_
 
     # Determine recommendation
     rec = "WATCH"
-    text_upper = research_text.upper() if research_text else ""
-    if "BUY" in text_upper and "PASS" not in text_upper:
-        rec = "BUY"
-    elif "PASS" in text_upper and "BUY" not in text_upper:
-        rec = "PASS"
+    if research_text:
+        rec_match = re.search(r'(?:recommendation|final assessment)[:\s]+\*?\*?(BUY|WATCH|PASS)\b', research_text, re.IGNORECASE)
+        if rec_match:
+            rec = rec_match.group(1).upper()
+        else:
+            # Fallback: check tail of text for recommendation keywords
+            text_upper = research_text.upper()
+            tail = text_upper[len(text_upper) * 4 // 5:]
+            if "BUY" in tail and "PASS" not in tail:
+                rec = "BUY"
+            elif "PASS" in tail and "BUY" not in tail:
+                rec = "PASS"
 
     lines = [f"### {name} ({ticker} — {exchange}) — {rec}"]
 
@@ -922,9 +937,15 @@ def build_watchlist_tier2_section(stock, research_text, prev_snapshot, is_first_
     exchange = get_exchange_label(stock["flag"])
 
     rec = "WATCH"
-    text_upper = research_text.upper() if research_text else ""
-    if "PASS" in text_upper:
-        rec = "PASS"
+    if research_text:
+        rec_match = re.search(r'(?:recommendation|final assessment)[:\s]+\*?\*?(WATCH|PASS)\b', research_text, re.IGNORECASE)
+        if rec_match:
+            rec = rec_match.group(1).upper()
+        else:
+            text_upper = research_text.upper()
+            tail = text_upper[len(text_upper) * 4 // 5:]
+            if "PASS" in tail:
+                rec = "PASS"
 
     lines = [f"### {name} ({ticker} — {exchange}) — {rec}"]
     lines.append(f"#### Quality: {stock['quality_rank']} | Value: {stock['value_rank']} | QV: {stock['qv_rank']}")
@@ -1015,10 +1036,15 @@ def generate_summary_file(filepath, unique_stocks, tiers, research_results,
             research = research_results.get(key, "")
             one_line = ""
             if research:
-                for sent in research.split(". "):
-                    sent = sent.strip()
-                    if len(sent) > 30:
-                        one_line = sent.rstrip(".") + "."
+                # Strip markdown headers and blank lines to find first real sentence
+                for para_line in research.split("\n"):
+                    stripped = para_line.strip()
+                    if not stripped or stripped.startswith("#") or stripped.startswith("*"):
+                        continue
+                    # Found a real paragraph line — take first sentence
+                    first_sentence = stripped.split(". ")[0].strip()
+                    if len(first_sentence) > 30:
+                        one_line = first_sentence.rstrip(".") + "."
                         break
             if not one_line:
                 one_line = "Research pending."
