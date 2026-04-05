@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Stock Portfolio & Watchlist Analyzer.
+"""Stock Research Engine.
 
-A command-line tool that takes CSV exports from Stockopedia and uses AI-powered
-research to generate actionable hold/sell recommendations for holdings and
-ranked buy candidates from a screened watchlist.
+Single CSV input. Three-pass AI research using claude-haiku-4-5-20251001.
+One output file per run.
 """
 
 import argparse
@@ -12,53 +11,34 @@ import os
 import re
 import sys
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
 import pandas as pd
 
-# ─── Version & Python Check ────────────────────────────────────────────────────
-
+# ── Python version check ────────────────────────────────────────────────────────
 MIN_PYTHON = (3, 10)
 if sys.version_info < MIN_PYTHON:
-    sys.exit(f"Error: Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required. "
+    sys.exit(f"Error: Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required. "
              f"You have {sys.version_info.major}.{sys.version_info.minor}.")
 
-# ─── Constants ──────────────────────────────────────────────────────────────────
+# ── Constants ───────────────────────────────────────────────────────────────────
+MODEL = "claude-haiku-4-5-20251001"
+WEB_SEARCH_TOOL = "web_search_20260209"
 
-MODEL_DEFAULT = "claude-haiku-4-5"
-MODEL_SEARCH = "claude-sonnet-4-6"  # Haiku doesn't support web search
-WEB_SEARCH_TOOL_TYPE = "web_search_20260209"
+TOKENS_FULL = 1500    # Pass 1 and Pass 2
+TOKENS_UPDATE = 400   # Pass 3 (Latest Updates)
 
-# Token budgets (hard max_tokens on every API call)
-TOKENS_FULL = 1500
-TOKENS_CONDENSED = 600
-TOKENS_UPDATE = 400
-TOKENS_SUMMARY = 600
+# Haiku pricing
+PRICE_INPUT = 0.80 / 1_000_000
+PRICE_OUTPUT = 4.00 / 1_000_000
+PRICE_PER_SEARCH = 0.01   # $10 per 1K searches = $0.01 each
 
-# Web search limits per API call
-SEARCHES_FULL = 1
-SEARCHES_CONDENSED = 1
-SEARCHES_UPDATE = 1
-
-# Pricing — Haiku default, Sonnet when using web search
-PRICE_INPUT_HAIKU = 0.80 / 1_000_000        # $0.80 per 1M input tokens
-PRICE_OUTPUT_HAIKU = 4.0 / 1_000_000        # $4 per 1M output tokens
-PRICE_INPUT_SONNET = 3.0 / 1_000_000        # $3 per 1M input tokens
-PRICE_OUTPUT_SONNET = 15.0 / 1_000_000      # $15 per 1M output tokens
-PRICE_PER_SEARCH = 10.0 / 1000              # $10 per 1K searches = $0.01 each
-
-# Cache settings
 CACHE_MAX_AGE_DAYS = 30
 HISTORY_MAX_SNAPSHOTS = 10
 OUTPUT_MAX_RUNS = 10
 
-# Tier thresholds
-TIER2_QV_THRESHOLD = 85
-
-# Paths
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
@@ -66,14 +46,18 @@ HISTORY_FILE = DATA_DIR / "history.json"
 ERROR_LOG = DATA_DIR / "errors.log"
 OUTPUT_DIR = BASE_DIR / "output"
 
-# Expected CSV columns
 EXPECTED_COLUMNS = [
     "Flag", "Ticker", "Name", "Last Price", "Mkt Cap (m GBP)", "Stock Rank™",
     "Quality Rank", "Value Rank", "Momentum Rank", "Momentum Rank Previous Day",
-    "QV Rank", "VM Rank", "QM Rank", "StockRank Style", "Risk Rating", "Sector"
+    "QV Rank", "VM Rank", "QM Rank", "StockRank Style", "Risk Rating", "Sector",
 ]
 
-# ─── Utility Functions ──────────────────────────────────────────────────────────
+
+# ── Utilities ───────────────────────────────────────────────────────────────────
+
+def utc_now():
+    """Return current UTC datetime."""
+    return datetime.now(timezone.utc)
 
 
 def ensure_dirs():
@@ -82,140 +66,62 @@ def ensure_dirs():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def log_error(ticker, error_msg):
-    """Append an error entry to the error log."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def log_error(ticker, msg):
+    """Append error to the error log with UTC timestamp."""
+    ts = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(ERROR_LOG, "a") as f:
-        f.write(f"[{timestamp}] {ticker}: {error_msg}\n")
-
-
-def derive_screen_name(filename):
-    """Derive a human-readable screen name from a watchlist filename.
-
-    Example: super_contrarians_page_1.csv -> 'Super Contrarians'
-    """
-    stem = Path(filename).stem
-    # Remove page number suffixes like _page_1, _page_2
-    stem = re.sub(r"_page_\d+$", "", stem)
-    # Replace underscores with spaces and title-case
-    return stem.replace("_", " ").title()
+        f.write(f"[{ts}] {ticker}: {msg}\n")
 
 
 def get_exchange_label(flag):
-    """Return exchange label for display."""
-    if flag == "gb":
-        return "LSE"
-    elif flag == "us":
-        return "NASDAQ/NYSE"
-    return flag.upper()
+    """Return human-readable exchange label."""
+    return {"gb": "LSE", "us": "NASDAQ/NYSE"}.get(flag.lower(), flag.upper())
 
 
-def get_search_suffix(flag):
-    """Return search suffix for web queries."""
-    if flag == "gb":
-        return "LSE"
-    elif flag == "us":
-        return "NASDAQ NYSE"
-    return ""
+def add_usage(total, usage):
+    """Accumulate usage counters."""
+    for k in ("input_tokens", "output_tokens", "search_requests"):
+        total[k] = total.get(k, 0) + usage.get(k, 0)
 
 
-def format_rank_delta(old_val, new_val):
-    """Format a rank change like '74→86 (+12)'."""
-    if old_val is None:
-        return str(new_val)
-    delta = new_val - old_val
-    sign = "+" if delta > 0 else ""
-    arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "→")
-    return f"{old_val}→{new_val} ({sign}{delta})"
+def calculate_cost(usage):
+    """Calculate dollar cost from a usage dict."""
+    return (
+        usage.get("input_tokens", 0) * PRICE_INPUT
+        + usage.get("output_tokens", 0) * PRICE_OUTPUT
+        + usage.get("search_requests", 0) * PRICE_PER_SEARCH
+    )
 
 
-def format_rank_arrow(old_val, new_val):
-    """Return just the arrow character for a rank change."""
-    if old_val is None:
-        return "→"
-    if new_val > old_val:
-        return "↑"
-    elif new_val < old_val:
-        return "↓"
-    return "→"
+# ── CSV Loading & Validation ───────────────────────────────────────────────────
 
-
-def local_now():
-    """Return current local time."""
-    return datetime.now()
-
-
-def utc_now():
-    """Return current UTC time."""
-    return datetime.now(timezone.utc)
-
-
-# ─── CSV Loading & Validation ──────────────────────────────────────────────────
-
-
-def validate_csv(filepath, label):
-    """Validate CSV has all expected columns. Exit on failure."""
+def load_stocks(stocks_path):
+    """Load and validate CSV. Return ordered dict of stock dicts keyed by flag_ticker."""
     try:
-        df = pd.read_csv(filepath)
+        df = pd.read_csv(stocks_path)
     except Exception as e:
-        sys.exit(f"Error: Could not read {label} CSV '{filepath}': {e}")
+        sys.exit(f"Error: Could not read CSV '{stocks_path}': {e}")
 
-    # Strip whitespace from column names
     df.columns = df.columns.str.strip()
-
-    missing = [col for col in EXPECTED_COLUMNS if col not in df.columns]
+    missing = [c for c in EXPECTED_COLUMNS if c not in df.columns]
     if missing:
         sys.exit(
-            f"Error: {label} CSV is missing required columns:\n"
-            + "\n".join(f"  - {col}" for col in missing)
+            "Error: CSV is missing required columns:\n"
+            + "\n".join(f"  - {c}" for c in missing)
             + f"\n\nFound columns: {', '.join(df.columns)}"
         )
-    return df
 
-
-def load_stocks(portfolio_path, watchlist_path):
-    """Load and validate both CSVs. Return portfolio_df, watchlist_df, and
-    a merged unique stocks dict keyed by (flag, ticker)."""
-    print(f"CSV validation: ", end="")
-
-    portfolio_df = validate_csv(portfolio_path, "Portfolio")
-    watchlist_df = validate_csv(watchlist_path, "Watchlist")
-    print("OK")
-
-    # Build unique stocks dict keyed by (flag, ticker)
-    unique = {}
-    for _, row in portfolio_df.iterrows():
-        key = (str(row["Flag"]).strip().lower(), str(row["Ticker"]).strip())
-        unique[key] = {
-            "ticker": str(row["Ticker"]).strip(),
-            "name": str(row["Name"]).strip(),
-            "flag": str(row["Flag"]).strip().lower(),
-            "last_price": row["Last Price"],
-            "mkt_cap": row["Mkt Cap (m GBP)"],
-            "stock_rank": int(row["Stock Rank™"]),
-            "quality_rank": int(row["Quality Rank"]),
-            "value_rank": int(row["Value Rank"]),
-            "momentum_rank": int(row["Momentum Rank"]),
-            "momentum_rank_previous_day": int(row["Momentum Rank Previous Day"]),
-            "qv_rank": int(row["QV Rank"]),
-            "vm_rank": int(row["VM Rank"]),
-            "qm_rank": int(row["QM Rank"]),
-            "stockrank_style": str(row["StockRank Style"]).strip(),
-            "risk_rating": str(row["Risk Rating"]).strip(),
-            "sector": str(row["Sector"]).strip(),
-            "in_portfolio": True,
-            "in_watchlist": False,
-        }
-
-    for _, row in watchlist_df.iterrows():
-        key = (str(row["Flag"]).strip().lower(), str(row["Ticker"]).strip())
-        if key in unique:
-            unique[key]["in_watchlist"] = True
-        else:
-            unique[key] = {
-                "ticker": str(row["Ticker"]).strip(),
+    stocks = {}
+    for _, row in df.iterrows():
+        flag = str(row["Flag"]).strip().lower()
+        ticker = str(row["Ticker"]).strip()
+        key = f"{flag}_{ticker}"
+        try:
+            stocks[key] = {
+                "key": key,
+                "ticker": ticker,
                 "name": str(row["Name"]).strip(),
-                "flag": str(row["Flag"]).strip().lower(),
+                "flag": flag,
                 "last_price": row["Last Price"],
                 "mkt_cap": row["Mkt Cap (m GBP)"],
                 "stock_rank": int(row["Stock Rank™"]),
@@ -229,28 +135,22 @@ def load_stocks(portfolio_path, watchlist_path):
                 "stockrank_style": str(row["StockRank Style"]).strip(),
                 "risk_rating": str(row["Risk Rating"]).strip(),
                 "sector": str(row["Sector"]).strip(),
-                "in_portfolio": False,
-                "in_watchlist": True,
             }
+        except (ValueError, KeyError) as e:
+            sys.exit(f"Error parsing row for {ticker}: {e}")
 
-    portfolio_count = sum(1 for s in unique.values() if s["in_portfolio"])
-    watchlist_count = sum(1 for s in unique.values() if s["in_watchlist"])
-    print(f"Portfolio: {portfolio_count} stocks | Watchlist: {watchlist_count} stocks | Unique: {len(unique)} stocks")
-
-    return portfolio_df, watchlist_df, unique
+    return stocks
 
 
-# ─── History Management ─────────────────────────────────────────────────────────
-
+# ── History Management ─────────────────────────────────────────────────────────
 
 def load_history():
-    """Load rank history from file. Returns dict keyed by 'flag_ticker'."""
+    """Load rank history. Returns dict keyed by flag_ticker."""
     if not HISTORY_FILE.exists():
         return {}
     try:
         with open(HISTORY_FILE) as f:
             data = json.load(f)
-        # Convert list format to dict keyed by flag_ticker
         if isinstance(data, list):
             return {f"{s['flag']}_{s['ticker']}": s for s in data}
         return data
@@ -259,16 +159,15 @@ def load_history():
 
 
 def save_history(history):
-    """Save rank history to file."""
+    """Persist rank history to disk."""
     with open(HISTORY_FILE, "w") as f:
         json.dump(history, f, indent=2)
 
 
 def add_snapshot(history, stock):
-    """Add a new rank snapshot for a stock. Trim to max 10 snapshots."""
-    key = f"{stock['flag']}_{stock['ticker']}"
-
-    snapshot = {
+    """Append a rank snapshot for this stock. Trim to max 10."""
+    key = stock["key"]
+    snap = {
         "timestamp_utc": utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "stock_rank": stock["stock_rank"],
         "quality_rank": stock["quality_rank"],
@@ -279,7 +178,6 @@ def add_snapshot(history, stock):
         "stockrank_style": stock["stockrank_style"],
         "risk_rating": stock["risk_rating"],
     }
-
     if key not in history:
         history[key] = {
             "ticker": stock["ticker"],
@@ -287,1060 +185,808 @@ def add_snapshot(history, stock):
             "flag": stock["flag"],
             "snapshots": [],
         }
-
-    history[key]["snapshots"].append(snapshot)
-    # Trim to max snapshots
+    history[key]["snapshots"].append(snap)
     if len(history[key]["snapshots"]) > HISTORY_MAX_SNAPSHOTS:
         history[key]["snapshots"] = history[key]["snapshots"][-HISTORY_MAX_SNAPSHOTS:]
 
 
-def get_previous_snapshot(history, stock):
-    """Get the most recent previous snapshot for a stock. Returns None if none."""
-    key = f"{stock['flag']}_{stock['ticker']}"
-    if key not in history or not history[key]["snapshots"]:
+def get_prev_snapshot(prev_history, stock):
+    """Return the most recent previous snapshot, or None."""
+    entry = prev_history.get(stock["key"], {})
+    snaps = entry.get("snapshots", [])
+    return snaps[-1] if snaps else None
+
+
+def get_qv_delta(stock, prev):
+    """QV rank change vs previous snapshot. None if no previous."""
+    if prev is None:
         return None
-    return history[key]["snapshots"][-1]
+    return stock["qv_rank"] - prev["qv_rank"]
 
 
-def calculate_qv_delta(stock, prev_snapshot):
-    """Calculate QV rank improvement since last snapshot."""
-    if prev_snapshot is None:
-        return None
-    return stock["qv_rank"] - prev_snapshot["qv_rank"]
 
-
-# ─── Tier Assignment ────────────────────────────────────────────────────────────
-
-
-def assign_tiers(unique_stocks, history, top_n, is_first_run):
-    """Assign tiers to all watchlist stocks. Returns dict of tier assignments."""
-    watchlist_stocks = {k: v for k, v in unique_stocks.items() if v["in_watchlist"]}
-    tiers = {}
-
-    if is_first_run:
-        # First run: use absolute QV rank
-        sorted_stocks = sorted(watchlist_stocks.items(),
-                               key=lambda x: x[1]["qv_rank"], reverse=True)
-        for i, (key, stock) in enumerate(sorted_stocks):
-            if i < top_n:
-                tiers[key] = 1
-            elif stock["qv_rank"] > TIER2_QV_THRESHOLD:
-                tiers[key] = 2
-            else:
-                tiers[key] = 3
-    else:
-        # Normal run: rank by QV improvement
-        deltas = {}
-        for key, stock in watchlist_stocks.items():
-            prev = get_previous_snapshot(history, stock)
-            delta = calculate_qv_delta(stock, prev)
-            deltas[key] = delta
-
-        # Sort by delta descending (None sorts last)
-        sorted_by_delta = sorted(
-            watchlist_stocks.items(),
-            key=lambda x: (deltas[x[0]] is not None, deltas[x[0]] or 0),
-            reverse=True
-        )
-
-        # Take top N improvers for Tier 1
-        tier1_count = 0
-        tier1_keys = set()
-        for key, stock in sorted_by_delta:
-            if tier1_count >= top_n:
-                break
-            delta = deltas[key]
-            if delta is not None and delta > 0:
-                tier1_keys.add(key)
-                tier1_count += 1
-
-        # If fewer than N improvers, fill with highest absolute QV
-        if tier1_count < top_n:
-            remaining = [(k, s) for k, s in sorted_by_delta if k not in tier1_keys]
-            remaining.sort(key=lambda x: x[1]["qv_rank"], reverse=True)
-            for key, stock in remaining:
-                if tier1_count >= top_n:
-                    break
-                tier1_keys.add(key)
-                tier1_count += 1
-
-        for key, stock in watchlist_stocks.items():
-            if key in tier1_keys:
-                tiers[key] = 1
-            elif stock["qv_rank"] > TIER2_QV_THRESHOLD:
-                tiers[key] = 2
-            else:
-                tiers[key] = 3
-
-    return tiers
-
-
-# ─── Cache Management ──────────────────────────────────────────────────────────
-
+# ── Cache Management ──────────────────────────────────────────────────────────
 
 def cache_path(stock):
     """Return the cache file path for a stock."""
     return CACHE_DIR / f"{stock['flag']}_{stock['ticker']}.md"
 
 
-def get_cache_age_days(stock):
+def cache_age_days(stock):
     """Return cache age in days, or None if no cache exists."""
-    path = cache_path(stock)
-    if not path.exists():
+    p = cache_path(stock)
+    if not p.exists():
         return None
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
     return (utc_now() - mtime).days
 
 
 def read_cache(stock):
-    """Read cached research for a stock. Returns content string or None."""
-    path = cache_path(stock)
-    if not path.exists():
-        return None
-    return path.read_text()
+    """Read cached research content, or None if absent."""
+    p = cache_path(stock)
+    return p.read_text() if p.exists() else None
 
 
 def write_cache(stock, content):
-    """Write or overwrite cache for a stock."""
-    path = cache_path(stock)
-    path.write_text(content)
+    """Write (overwrite) cache for a stock."""
+    cache_path(stock).write_text(content)
 
 
-def append_cache(stock, update_block):
-    """Append an update block to existing cache."""
-    path = cache_path(stock)
-    existing = path.read_text() if path.exists() else ""
-    path.write_text(existing + "\n\n" + update_block)
+def append_cache_update(stock, update_block):
+    """Append a dated update block to existing cache."""
+    p = cache_path(stock)
+    existing = p.read_text() if p.exists() else ""
+    p.write_text(existing.rstrip() + "\n\n" + update_block + "\n")
 
 
-def determine_research_action(stock, tier, force_refresh=False):
-    """Determine what research action is needed for a stock.
-
-    Returns one of: 'full', 'condensed', 'update', 'cache', 'none'
-    """
+def determine_action(stock, force_refresh):
+    """Return 'full' or 'update' for this stock."""
     if force_refresh:
-        return "full" if tier <= 1 else ("condensed" if tier == 2 else "none")
-
-    cache_age = get_cache_age_days(stock)
-
-    # Tier 3: never call API
-    if tier == 3:
-        return "none"
-
-    # No cache: full or condensed based on tier
-    if cache_age is None:
-        return "full" if tier == 1 else "condensed"
-
-    # Cache expired
-    if cache_age > CACHE_MAX_AGE_DAYS:
-        return "full" if tier == 1 else "condensed"
-
-    # Tier 1 always gets full research (rank jump is new info)
-    if tier == 1:
         return "full"
-
-    # Tier 2 with valid cache: lightweight update
-    if tier == 2:
-        return "update"
-
-    return "none"
+    age = cache_age_days(stock)
+    if age is None or age > CACHE_MAX_AGE_DAYS:
+        return "full"
+    return "update"
 
 
-# ─── Research Prompts ───────────────────────────────────────────────────────────
+def strip_cache_header(cached_text):
+    """Strip the cache file header (# Name, ## Research — date) from cached text."""
+    lines = cached_text.split("\n")
+    start = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("# ") or stripped.startswith("## Research") or stripped == "":
+            start = i + 1
+        else:
+            break
+    return "\n".join(lines[start:]).strip()
 
 
-def build_full_research_prompt(stock, prev_snapshot, is_first_run, is_portfolio):
-    """Build the system+user prompt for a full research pass."""
+# ── Research Prompts ──────────────────────────────────────────────────────────
+
+def build_pass1_prompt(stock, prev, is_first_run):
+    """Build Pass 1 prompt — Haiku knowledge pass, no web search."""
+    name = stock["name"]
+    exchange = get_exchange_label(stock["flag"])
+    currency = "GBP" if stock["flag"] == "gb" else "USD"
+
+    rank_lines = (
+        f"Stock Rank: {stock['stock_rank']} | Quality Rank: {stock['quality_rank']} | "
+        f"Value Rank: {stock['value_rank']} | Momentum Rank: {stock['momentum_rank']}\n"
+        f"QV Rank: {stock['qv_rank']} | StockRank Style: {stock['stockrank_style']} | "
+        f"Risk Rating: {stock['risk_rating']}\n"
+        f"Sector: {stock['sector']} | Market Cap: {stock['mkt_cap']}m GBP | "
+        f"Last Price: {stock['last_price']}"
+    )
+
+    prev_block = ""
+    if prev and not is_first_run:
+        delta = stock["qv_rank"] - prev["qv_rank"]
+        sign = "+" if delta >= 0 else ""
+        prev_block = (
+            f"\n\nPrevious snapshot ({prev['timestamp_utc']}):\n"
+            f"QV Rank: {prev['qv_rank']} → {stock['qv_rank']} ({sign}{delta}) | "
+            f"Quality: {prev['quality_rank']} | Value: {prev['value_rank']} | "
+            f"Momentum: {prev['momentum_rank']} | Style: {prev['stockrank_style']}"
+        )
+
+    baseline_note = (
+        "\n\nBASELINE RUN — no previous snapshot data. "
+        "Note in the rank sense-check that this is the baseline."
+    ) if is_first_run else ""
+
+    system = (
+        "You are a stock research analyst writing for a UK private investor. "
+        "Write exclusively in flowing prose — absolutely no bullet points, numbered lists, or dashes. "
+        "Every section must contain 2-4 sentences of specific, well-informed analysis. "
+        "Total across all eight items: approximately 400-500 words. "
+        "Always label currency as GBP or USD on any financial figure. "
+        "Be balanced: give fair weight to both bull and bear considerations."
+    )
+
+    user = f"""Write a research report on {name} ({exchange}) for a UK investor.
+
+Stockopedia data:
+{rank_lines}{prev_block}{baseline_note}
+
+Use these exact section headers with bold formatting. Write flowing prose under each — no lists, no dashes.
+
+**1. Stockopedia Rank Sense-Check**
+Does the Quality Rank and Value Rank hold up against what is actually known about this company? Are the ranks justified by genuine fundamentals or potentially distorted by one-off events?
+
+**2. Current Company Narrative**
+What has happened at this company in the last 3-6 months? Earnings, guidance changes, management moves, contract wins, strategic shifts. What explains any rank movement?
+
+**3. Multibagger Potential**
+The bull case across three lenses: credible path to significantly higher revenue, margin expansion potential through operational leverage or pricing power, and re-rating potential if the stock is genuinely undervalued.
+
+**4. Bear Case**
+Two or three specific, credible risks for this company and sector right now. Not generic market risk — company-specific and sector-specific risks only.
+
+**5. ESG and Sustainability**
+Material ESG factors relevant to this company's sector. Any recent controversies. Is the ESG trajectory improving or deteriorating?
+
+**6. Financial Health Red Flags**
+Quick scan: unusual debt structures, cash flow concerns, recent dilution, off-balance-sheet risks. If nothing flags, say so in one sentence.
+
+**8. Final Assessment — Buy / Watch / Sell**
+One paragraph. The recommendation must be exactly one of: Buy, Watch, or Sell — no other labels. State it clearly in the first sentence with a brief rationale.
+
+Where your training knowledge is limited or confidence is low for sections 1, 2, or 3, include the exact phrase <<LOW CONFIDENCE>> somewhere in that section.
+
+On the very last line of your response, write exactly one of:
+PASS2_NEEDED: YES
+PASS2_NEEDED: NO
+
+Write YES if any of sections 1, 2, or 3 contain <<LOW CONFIDENCE>>. Write NO if those sections are well-covered from training data alone."""
+
+    return system, user
+
+
+def build_pass2_prompt(stock, pass1_clean):
+    """Build Pass 2 prompt — conditional web search for sections 1-3 gaps."""
+    name = stock["name"]
+    exchange = get_exchange_label(stock["flag"])
+
+    system = (
+        "You are a stock research analyst supplementing an existing research report. "
+        "Use your web search tool to find current company information. "
+        "Be concise — 2-3 sentences of genuinely new information only. "
+        "Do not repeat anything already stated in the existing analysis."
+    )
+
+    user = f"""You are supplementing a research report on {name} ({exchange}).
+
+The initial analysis flagged gaps in sections 1, 2, or 3 (Rank Sense-Check, Current Narrative, Multibagger Potential) because training knowledge was insufficient for some details.
+
+Use the web search tool to find the most recent earnings report, trading update, or significant company announcement for {name} on {exchange}. Always search by the full company name — never by ticker alone.
+
+Here is the beginning of the existing Pass 1 analysis for context:
+
+{pass1_clean[:900]}
+
+Write 2-3 sentences of supplementary information that fills the most material gaps identified. Focus only on information that is new or that updates/corrects the existing analysis.
+
+Label your response with this exact header:
+**Web Search Supplement**
+
+Then write your supplementary sentences below it."""
+
+    return system, user
+
+
+def build_pass3_prompt(stock):
+    """Build Pass 3 prompt — always-on Latest Updates search."""
     name = stock["name"]
     flag = stock["flag"]
     exchange = get_exchange_label(flag)
-    search_suffix = get_search_suffix(flag)
 
-    rank_context = f"""Current ranks:
-- Stock Rank: {stock['stock_rank']}
-- Quality Rank: {stock['quality_rank']}
-- Value Rank: {stock['value_rank']}
-- Momentum Rank: {stock['momentum_rank']}
-- QV Rank: {stock['qv_rank']}
-- StockRank Style: {stock['stockrank_style']}
-- Risk Rating: {stock['risk_rating']}
-- Sector: {stock['sector']}
-- Market Cap: {stock['mkt_cap']}m GBP
-- Last Price: {stock['last_price']}"""
-
-    if prev_snapshot and not is_first_run:
-        rank_context += f"""
-
-Previous snapshot ({prev_snapshot['timestamp_utc']}):
-- Stock Rank: {prev_snapshot['stock_rank']}
-- Quality Rank: {prev_snapshot['quality_rank']}
-- Value Rank: {prev_snapshot['value_rank']}
-- Momentum Rank: {prev_snapshot['momentum_rank']}
-- QV Rank: {prev_snapshot['qv_rank']}
-- StockRank Style: {prev_snapshot['stockrank_style']}"""
-
-        qv_delta = stock["qv_rank"] - prev_snapshot["qv_rank"]
-        if qv_delta > 0:
-            rank_context += f"\n\nQV Rank has improved by {qv_delta} points since last snapshot. This is the key question: what has driven this improvement?"
-
-    system_prompt = """You are a stock research analyst. Write in flowing prose, not bullet points. Always label currency (GBP or USD) on any financial figure. Be balanced — give equal weight to bull and bear cases. Be specific to this company, not generic."""
-
-    if is_portfolio:
-        action_instruction = "End with a HOLD or SELL recommendation with a one-paragraph rationale. Flag rank deterioration as a sell signal and rank improvement as strengthening the hold case."
+    if flag == "gb":
+        search_guidance = (
+            f"Search for the most recent RNS (Regulatory News Service) announcements for "
+            f"{name} on the London Stock Exchange. Look for trading updates, director dealings, "
+            f"results announcements, or material regulatory news."
+        )
     else:
-        action_instruction = "End with a BUY, WATCH, or PASS recommendation with a one-paragraph rationale focused on whether any QV rank improvement is a credible entry signal."
+        search_guidance = (
+            f"Search for the most recent SEC filings (8-K, 10-Q, or 10-K) or official "
+            f"press releases for {name} listed on a US exchange."
+        )
 
-    user_prompt = f"""Research {name} ({exchange}) for a UK investor.
+    system = (
+        "You are a stock research analyst. Find only the most recent official announcement. "
+        "Write 1-2 sentences maximum. "
+        "If nothing material is found within the last 6 months, say so clearly in one sentence."
+    )
 
-{rank_context}
+    user = f"""Find the most recent official announcement for {name} ({exchange}).
 
-{"BASELINE RUN — no previous data available. Rank change tracking begins from next run." if is_first_run else ""}
+{search_guidance}
 
-Write a research report covering these six elements in flowing prose (400-500 words total):
+Important: always search using the full company name — never by ticker symbol alone.
 
-1. RANK SENSE-CHECK: Do the Quality and Value ranks hold up against what is actually happening at the company? Are improving ranks justified by real fundamental change, or distorted by a one-off event?
+Write 1-2 sentences covering only the most material recent announcement. Include the approximate date if found. If no material announcement was published in the last 6 months, state that clearly in one sentence.
 
-2. CURRENT COMPANY NARRATIVE: What has happened in the last 3-6 months? Earnings, guidance, management changes, contract wins, strategic shifts. Look for the event or trend that explains any rank improvement.
+This will populate the "7. Latest Updates" section of the research report."""
 
-3. MULTIBAGGER POTENTIAL: The bull case across three lenses — revenue growth (credible path to significantly higher sales?), margin expansion (operational leverage, pricing power?), and multiple re-rating (genuinely undervalued with room for market recognition?).
-
-4. BEAR CASE: The 2-3 most credible specific risks right now. Specific to this company and sector, not generic market risk.
-
-5. ESG AND SUSTAINABILITY: Material ESG factors for this company's sector. Any recent controversies. Is the ESG trajectory improving or deteriorating?
-
-6. FINANCIAL HEALTH RED FLAGS: Brief scan — flag anything contradicting the ranks: unusual debt, cash flow concerns, recent dilution. If nothing flags, say so in one sentence.
-
-{action_instruction}"""
-
-    return system_prompt, user_prompt
+    return system, user
 
 
-def build_condensed_research_prompt(stock, prev_snapshot, is_first_run):
-    """Build prompt for a condensed Tier 2 research pass."""
-    name = stock["name"]
-    exchange = get_exchange_label(stock["flag"])
-    search_suffix = get_search_suffix(stock["flag"])
 
-    rank_context = f"Quality: {stock['quality_rank']} | Value: {stock['value_rank']} | QV: {stock['qv_rank']} | Style: {stock['stockrank_style']} | Risk: {stock['risk_rating']} | Sector: {stock['sector']}"
+# ── API Calls ─────────────────────────────────────────────────────────────────
 
-    system_prompt = """You are a stock research analyst. Write in flowing prose, not bullet points. Always label currency (GBP or USD). Be concise."""
-
-    user_prompt = f"""Condensed research on {name} ({exchange}) for a UK investor.
-
-{rank_context}
-
-{"BASELINE RUN — no previous data available." if is_first_run else ""}
-
-Write a condensed assessment (~200 words) covering:
-1. RANK SENSE-CHECK: Do the QV ranks match what's happening at the company?
-2. MULTIBAGGER POTENTIAL: Brief bull case — revenue growth, margin expansion, re-rating potential.
-3. FINAL ASSESSMENT: WATCH or PASS with brief rationale."""
-
-    return system_prompt, user_prompt
-
-
-def build_update_prompt(stock, existing_cache):
-    """Build prompt for a lightweight cache update."""
-    name = stock["name"]
-    exchange = get_exchange_label(stock["flag"])
-    search_suffix = get_search_suffix(stock["flag"])
-
-    system_prompt = """You are a stock research analyst. Be extremely concise. One paragraph only."""
-
-    user_prompt = f"""Lightweight update for {name} ({exchange}).
-
-Current ranks: Quality {stock['quality_rank']} | Value {stock['value_rank']} | QV {stock['qv_rank']} | Style: {stock['stockrank_style']}
-
-Write ONE concise paragraph covering only material changes since the last research. If nothing material has changed, say so in one sentence. Do not repeat background information."""
-
-    return system_prompt, user_prompt
-
-
-# ─── API Calls ──────────────────────────────────────────────────────────────────
-
-
-def make_research_call(client, system_prompt, user_prompt, max_tokens, max_searches, use_search=False):
-    """Make a research API call, optionally with web search. Retries on rate limit."""
-    model = MODEL_SEARCH if use_search else MODEL_DEFAULT
+def call_api(client, system, user, max_tokens, use_search=False):
+    """Make a Haiku API call, optionally with web search. Retries on rate limit.
+    Returns (text, usage_dict).
+    """
     kwargs = {
-        "model": model,
+        "model": MODEL,
         "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
     }
-
-    if use_search and max_searches > 0:
+    if use_search:
         kwargs["tools"] = [{
-            "type": WEB_SEARCH_TOOL_TYPE,
+            "type": WEB_SEARCH_TOOL,
             "name": "web_search",
-            "max_uses": max_searches,
+            "max_uses": 1,
         }]
 
-    max_retries = 5
-    for attempt in range(max_retries):
+    for attempt in range(5):
         try:
-            response = client.messages.create(**kwargs)
-
-            # Extract text from response
-            text_parts = []
-            for block in response.content:
-                if hasattr(block, "text"):
-                    text_parts.append(block.text)
-
-            text = "\n".join(text_parts)
-
+            resp = client.messages.create(**kwargs)
+            text = "\n".join(
+                block.text for block in resp.content if hasattr(block, "text")
+            )
+            search_reqs = 0
+            if hasattr(resp.usage, "server_tool_use") and resp.usage.server_tool_use:
+                search_reqs = resp.usage.server_tool_use.web_search_requests
             usage = {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-                "search_requests": 0,
+                "input_tokens": resp.usage.input_tokens,
+                "output_tokens": resp.usage.output_tokens,
+                "search_requests": search_reqs,
             }
-            if response.usage.server_tool_use:
-                usage["search_requests"] = response.usage.server_tool_use.web_search_requests
-
             return text, usage
-
-        except anthropic.RateLimitError as e:
-            if attempt < max_retries - 1:
-                wait_time = 60 * (attempt + 1)  # 60s, 120s, 180s, 240s
-                print(f" rate limited, waiting {wait_time}s...", end="", flush=True)
-                time.sleep(wait_time)
+        except anthropic.RateLimitError:
+            if attempt < 4:
+                wait = 60 * (attempt + 1)
+                print(f" [rate limited — waiting {wait}s]", end="", flush=True)
+                time.sleep(wait)
             else:
                 raise
 
 
-def calculate_cost(usage):
-    """Calculate dollar cost from a usage dict."""
-    if usage.get("search_requests", 0) > 0:
-        # Sonnet pricing when web search was used
-        input_price = PRICE_INPUT_SONNET
-        output_price = PRICE_OUTPUT_SONNET
+# ── Three-Pass Research Orchestration ────────────────────────────────────────
+
+def run_full_research(client, stock, prev, is_first_run, delay):
+    """Run all three passes. Returns (pass1_clean, pass2_text, pass3_text, usage, pass2_triggered)."""
+    total = {"input_tokens": 0, "output_tokens": 0, "search_requests": 0}
+
+    # ── Pass 1: Haiku knowledge pass (no web search) ──────────────────────────
+    print(f"       Pass 1: Haiku knowledge pass...", end="", flush=True)
+    sys1, usr1 = build_pass1_prompt(stock, prev, is_first_run)
+    p1_raw, u1 = call_api(client, sys1, usr1, TOKENS_FULL, use_search=False)
+    add_usage(total, u1)
+    cost1 = calculate_cost(u1)
+    print(f" done (${cost1:.3f})", flush=True)
+
+    # Extract PASS2_NEEDED marker and clean text
+    pass2_needed = "PASS2_NEEDED: YES" in p1_raw
+    pass1_clean = re.sub(r'\nPASS2_NEEDED:.*$', '', p1_raw, flags=re.MULTILINE).strip()
+
+    time.sleep(delay)
+
+    # ── Pass 2: Targeted web search (conditional) ─────────────────────────────
+    pass2_text = ""
+    if pass2_needed:
+        print(f"       Pass 2: Web search triggered...", end="", flush=True)
+        sys2, usr2 = build_pass2_prompt(stock, pass1_clean)
+        pass2_text, u2 = call_api(client, sys2, usr2, TOKENS_FULL, use_search=True)
+        add_usage(total, u2)
+        cost2 = calculate_cost(u2)
+        searches2 = u2.get("search_requests", 0)
+        print(f" done (${cost2:.3f}, {searches2} search)", flush=True)
+        time.sleep(delay)
     else:
-        # Haiku pricing
-        input_price = PRICE_INPUT_HAIKU
-        output_price = PRICE_OUTPUT_HAIKU
+        print(f"       Pass 2: Web search skipped (Pass 1 coverage sufficient)", flush=True)
+
+    # ── Pass 3: Latest Updates (always runs) ──────────────────────────────────
+    print(f"       Pass 3: Latest Updates search...", end="", flush=True)
+    sys3, usr3 = build_pass3_prompt(stock)
+    pass3_text, u3 = call_api(client, sys3, usr3, TOKENS_UPDATE, use_search=True)
+    add_usage(total, u3)
+    cost3 = calculate_cost(u3)
+    searches3 = u3.get("search_requests", 0)
+    print(f" done (${cost3:.3f}, {searches3} search)", flush=True)
+
+    return pass1_clean, pass2_text, pass3_text, total, pass2_needed
+
+
+def run_update_research(client, stock, delay):
+    """Run Pass 3 only (cache is fresh). Returns (pass3_text, usage)."""
+    print(f"       Pass 1: skipped (cached)", flush=True)
+    print(f"       Pass 2: skipped (cached)", flush=True)
+    print(f"       Pass 3: Latest Updates search...", end="", flush=True)
+    sys3, usr3 = build_pass3_prompt(stock)
+    pass3_text, usage = call_api(client, sys3, usr3, TOKENS_UPDATE, use_search=True)
+    cost3 = calculate_cost(usage)
+    searches3 = usage.get("search_requests", 0)
+    print(f" done (${cost3:.3f}, {searches3} search)", flush=True)
+    return pass3_text, usage
+
+
+# ── Write-up Assembly ─────────────────────────────────────────────────────────
+
+def _find_marker(text, markers):
+    """Return the index of the first marker found in text, or -1."""
+    for m in markers:
+        idx = text.find(m)
+        if idx != -1:
+            return idx
+    return -1
+
+
+def insert_before_section8(text, section7_block):
+    """Insert section 7 block before section 8 in the text."""
+    idx = _find_marker(text, ["**8.", "8. Final Assessment", "Final Assessment"])
+    if idx != -1:
+        return text[:idx].rstrip() + "\n\n" + section7_block + "\n\n" + text[idx:]
+    # Section 8 not found — append section 7 at the end
+    return text.rstrip() + "\n\n" + section7_block
+
+
+def insert_after_section3(text, supplement):
+    """Insert Pass 2 supplement after section 3, before section 4."""
+    idx = _find_marker(text, ["**4.", "4. Bear Case", "Bear Case"])
+    if idx != -1:
+        return text[:idx].rstrip() + "\n\n" + supplement + "\n\n" + text[idx:]
+    # Fall back: append at end of section 3 area
+    idx3 = _find_marker(text, ["**3.", "3. Multibagger", "Multibagger Potential"])
+    if idx3 != -1:
+        # Find end of section 3 content by looking for next **X. pattern
+        after3 = text[idx3 + 3:]
+        next_sec = re.search(r'\*\*[456789]\.', after3)
+        if next_sec:
+            split_at = idx3 + 3 + next_sec.start()
+            return text[:split_at].rstrip() + "\n\n" + supplement + "\n\n" + text[split_at:]
+    return text.rstrip() + "\n\n" + supplement
+
+
+def assemble_full_writeup(pass1_clean, pass2_text, pass3_text):
+    """Combine three passes into the final ordered 8-section write-up."""
+    text = pass1_clean
+
+    # Insert Pass 2 supplement after section 3, before section 4 (if it ran)
+    if pass2_text.strip():
+        text = insert_after_section3(text, pass2_text.strip())
+
+    # Build and insert section 7 (Latest Updates) before section 8
+    section7 = f"**7. Latest Updates**\n\n{pass3_text.strip()}"
+    text = insert_before_section8(text, section7)
+
+    return text
+
+
+def extract_recommendation(text):
+    """Extract Buy / Watch / Sell from research text. Default: Watch.
+
+    Searches the body of section 8 (after the header line) to avoid matching
+    the literal 'Buy / Watch / Sell' in the section header itself.
+    """
+    # Try to match the body of section 8 — skip past the bold header line
+    fa_body = re.search(
+        r'\*\*8\.\s*Final Assessment[^*\n]*\*\*\s*\n+(.*?)(?=\n\*\*[0-9]\.|\Z)',
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if fa_body:
+        search_in = fa_body.group(1)
+    else:
+        # Fall back: look in the last 400 chars of text
+        search_in = text[-400:] if len(text) > 400 else text
+
+    upper = search_in.upper()
+    if re.search(r'\bSELL\b', upper):
+        return "SELL"
+    if re.search(r'\bBUY\b', upper):
+        return "BUY"
+    return "WATCH"
+
+
+
+# ── Tier / Ordering Logic ─────────────────────────────────────────────────────
+
+def compute_tiers(stocks_list, prev_history, is_first_run, top_n):
+    """Return (tier1_keys_ordered, remaining_keys_ordered).
+
+    Tier 1: top_n by QV delta (or absolute QV on first run), largest delta first.
+            Ties broken by absolute QV rank descending.
+    Remaining: ordered by absolute QV rank descending.
+    """
+    keys = list(stocks_list.keys())
+
+    if is_first_run:
+        sorted_all = sorted(keys, key=lambda k: stocks_list[k]["qv_rank"], reverse=True)
+        tier1 = sorted_all[:top_n]
+        remaining = sorted_all[top_n:]
+        return tier1, remaining
+
+    # Compute QV deltas
+    deltas = {}
+    for k in keys:
+        stock = stocks_list[k]
+        prev_snaps = prev_history.get(k, {}).get("snapshots", [])
+        if prev_snaps:
+            deltas[k] = stock["qv_rank"] - prev_snaps[-1]["qv_rank"]
+        else:
+            deltas[k] = None
+
+    # Sort: known deltas first (descending), then None; ties broken by absolute QV
+    def tier1_sort(k):
+        d = deltas[k]
+        qv = stocks_list[k]["qv_rank"]
+        return (d is not None, d if d is not None else -9999, qv)
+
+    sorted_by_delta = sorted(keys, key=tier1_sort, reverse=True)
+    tier1 = sorted_by_delta[:top_n]
+    remaining = sorted(
+        sorted_by_delta[top_n:],
+        key=lambda k: stocks_list[k]["qv_rank"],
+        reverse=True,
+    )
+    return tier1, remaining
+
+
+# ── Output File Generation ────────────────────────────────────────────────────
+
+def format_qv_header(stock, prev, is_first_run):
+    """Format the rank header line for a stock section."""
+    qv = stock["qv_rank"]
+    q = stock["quality_rank"]
+    v = stock["value_rank"]
+    m = stock["momentum_rank"]
+    style = stock["stockrank_style"]
+
+    if prev and not is_first_run:
+        delta = qv - prev["qv_rank"]
+        sign = "+" if delta >= 0 else ""
+        qv_str = f"QV: {prev['qv_rank']}→{qv} ({sign}{delta})"
+    else:
+        qv_str = f"QV: {qv} →"
+
+    return f"#### {qv_str} | Quality: {q} | Value: {v} | Momentum: {m} | {style}"
+
+
+def build_stock_section(stock, writeup, prev, is_first_run, is_update=False, pass3_update=""):
+    """Build the markdown output block for one stock."""
+    name = stock["name"]
+    ticker = stock["ticker"]
+    exchange = get_exchange_label(stock["flag"])
+    rec = extract_recommendation(writeup)
+
+    lines = []
+    lines.append(f"### {name} ({ticker} — {exchange}) — {rec}")
+    lines.append(format_qv_header(stock, prev if not is_first_run else None, is_first_run))
+    if is_first_run:
+        lines.append("")
+        lines.append("*Baseline run — no previous data. Rank change tracking begins from next run.*")
+    lines.append("")
+    lines.append(writeup)
+
+    # For update stocks, append the new Pass 3 update block below the cached write-up
+    if is_update and pass3_update.strip():
+        today = utc_now().strftime("%Y-%m-%d")
+        lines.append(f"\n### Update — {today} UTC\n\n{pass3_update.strip()}")
+
+    lines.append("\n---\n")
+    return "\n".join(lines)
+
+
+def build_error_section(stock):
+    """Build the error placeholder section for a failed stock."""
+    name = stock["name"]
+    ticker = stock["ticker"]
+    exchange = get_exchange_label(stock["flag"])
+    lines = [
+        f"### {name} ({ticker} — {exchange})",
+        "",
+        f"Research unavailable due to API error. Retry with: `--refresh {ticker}`",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_summary_prose(stocks_list, tier1_keys, prev_history, is_first_run):
+    """Generate the summary section as flowing prose without an extra API call."""
+    now = utc_now()
+    total = len(stocks_list)
+    t1 = len(tier1_keys)
+
+    if is_first_run:
+        names = [stocks_list[k]["name"] for k in tier1_keys[:3]]
+        names_str = ", ".join(names)
+        if t1 > 3:
+            names_str += f" and {t1 - 3} others"
+        return (
+            f"This is the baseline run covering {total} stocks analysed on "
+            f"{now.strftime('%d %B %Y')}. Rank history begins from this run — from the next "
+            f"session onwards, QV rank movements will drive the ordering of stocks in this report. "
+            f"Today's top QV performers include {names_str}. "
+            f"All stocks have been researched across three passes and cached. "
+            f"All recommendations use Buy, Watch, or Sell throughout."
+        )
+
+    # Normal run — describe movers
+    movers = []
+    for k in tier1_keys:
+        s = stocks_list[k]
+        prev_snaps = prev_history.get(k, {}).get("snapshots", [])
+        if prev_snaps:
+            delta = s["qv_rank"] - prev_snaps[-1]["qv_rank"]
+            movers.append((s["name"], delta, s["qv_rank"]))
+
+    movers.sort(key=lambda x: x[1], reverse=True)
+
+    if movers:
+        top = movers[0]
+        sign = "+" if top[1] >= 0 else ""
+        top_str = (
+            f"{top[0]} led the movers with a QV rank change of {sign}{top[1]} to "
+            f"a current QV of {top[2]}"
+        )
+    else:
+        top_str = "no material QV rank movements were detected since the last run"
+
+    # Count any negative movers in Tier 1
+    declines = [(n, d) for n, d, _ in movers if d < 0]
+    decline_note = ""
+    if declines:
+        decline_note = (
+            f" {declines[0][0]} showed a decline of {declines[0][1]} points, "
+            f"warranting closer attention."
+        )
+
     return (
-        usage["input_tokens"] * input_price
-        + usage["output_tokens"] * output_price
-        + usage.get("search_requests", 0) * PRICE_PER_SEARCH
+        f"This report covers {total} stocks as of {now.strftime('%d %B %Y')} "
+        f"{now.strftime('%H:%M')} UTC. "
+        f"The top {t1} stocks by QV rank movement are highlighted in Tier 1. "
+        f"{top_str.capitalize()}.{decline_note} "
+        f"Full three-pass research was run for stocks requiring updates; "
+        f"cached stocks received a Pass 3 Latest Updates refresh only. "
+        f"All recommendations are Buy, Watch, or Sell."
     )
 
 
-def research_stock(client, stock, action, prev_snapshot, is_first_run, is_portfolio, delay, use_search=False):
-    """Research a single stock. Returns (research_text, usage_dict) or raises."""
-    if action == "full":
-        system_prompt, user_prompt = build_full_research_prompt(
-            stock, prev_snapshot, is_first_run, is_portfolio
-        )
-        text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_FULL, SEARCHES_FULL, use_search=use_search)
-        # Write to cache
-        timestamp = utc_now().strftime("%Y-%m-%d")
-        header = f"# {stock['name']} ({stock['ticker']} — {get_exchange_label(stock['flag'])})\n## Research — {timestamp} UTC\n\n"
-        existing = read_cache(stock)
-        if existing:
-            # Append as new dated block
-            append_cache(stock, f"\n## Full Research — {timestamp} UTC\n\n{text}")
-        else:
-            write_cache(stock, header + text)
-        return text, usage
+def generate_output_file(stocks_list, tier1_keys, remaining_keys,
+                         research_results, prev_history, is_first_run):
+    """Generate the single output markdown file. Returns the file path."""
+    now = utc_now()
+    filename = now.strftime("%Y-%m-%d_%H%M") + "_analysis.md"
+    filepath = OUTPUT_DIR / filename
+    # Handle same-minute collision
+    if filepath.exists():
+        filename = now.strftime("%Y-%m-%d_%H%M") + "_2_analysis.md"
+        filepath = OUTPUT_DIR / filename
 
-    elif action == "condensed":
-        system_prompt, user_prompt = build_condensed_research_prompt(
-            stock, prev_snapshot, is_first_run
-        )
-        text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_CONDENSED, SEARCHES_CONDENSED, use_search=use_search)
-        timestamp = utc_now().strftime("%Y-%m-%d")
-        existing = read_cache(stock)
-        if existing:
-            append_cache(stock, f"\n## Condensed Research — {timestamp} UTC\n\n{text}")
-        else:
-            header = f"# {stock['name']} ({stock['ticker']} — {get_exchange_label(stock['flag'])})\n"
-            write_cache(stock, header + f"## Condensed Research — {timestamp} UTC\n\n{text}")
-        return text, usage
+    lines = [
+        f"# Stock Analysis Report — {now.strftime('%d %B %Y')} {now.strftime('%H:%M')} UTC",
+        "",
+        "## Summary",
+        "",
+        generate_summary_prose(stocks_list, tier1_keys, prev_history, is_first_run),
+        "",
+        "---",
+        "",
+        "## Tier 1 — Top QV Rank Movers",
+        "",
+    ]
 
-    elif action == "update":
-        existing_cache = read_cache(stock) or ""
-        system_prompt, user_prompt = build_update_prompt(stock, existing_cache)
-        text, usage = make_research_call(client, system_prompt, user_prompt,
-                                         TOKENS_UPDATE, SEARCHES_UPDATE, use_search=use_search)
-        timestamp = utc_now().strftime("%Y-%m-%d")
-        append_cache(stock, f"### Update — {timestamp} UTC\n{text}")
-        return text, usage
+    for key in tier1_keys:
+        stock = stocks_list[key]
+        result = research_results.get(key, {})
+        if result.get("error"):
+            lines.append(build_error_section(stock))
+            continue
 
-    return "", {"input_tokens": 0, "output_tokens": 0, "search_requests": 0}
+        writeup = result.get("writeup", "")
+        is_update = result.get("action") == "update"
+        pass3_update = result.get("pass3_text", "") if is_update else ""
 
+        prev = None
+        if prev_history and key in prev_history:
+            snaps = prev_history[key].get("snapshots", [])
+            if snaps:
+                prev = snaps[-1]
 
-# ─── Cost Estimation & Trial Mode ──────────────────────────────────────────────
+        lines.append(build_stock_section(
+            stock, writeup, prev, is_first_run,
+            is_update=is_update, pass3_update=pass3_update,
+        ))
 
+    if not tier1_keys:
+        lines.append("*No Tier 1 stocks this run.*")
+        lines.append("")
 
-def estimate_full_run_cost(trial_usage, trial_stock_count, run_plan):
-    """Estimate full run cost based on trial results."""
-    if trial_stock_count == 0:
-        return 0.0
+    lines += ["---", "", "## Remaining Stocks — By QV Rank", ""]
 
-    avg_cost_per_full = calculate_cost({
-        "input_tokens": trial_usage["input_tokens"] // trial_stock_count,
-        "output_tokens": trial_usage["output_tokens"] // trial_stock_count,
-        "search_requests": trial_usage["search_requests"] // trial_stock_count,
-    })
+    for key in remaining_keys:
+        stock = stocks_list[key]
+        result = research_results.get(key, {})
+        if result.get("error"):
+            lines.append(build_error_section(stock))
+            continue
 
-    # Scale condensed and update costs relative to full
-    condensed_ratio = TOKENS_CONDENSED / TOKENS_FULL
-    update_ratio = TOKENS_UPDATE / TOKENS_FULL
+        writeup = result.get("writeup", "")
+        is_update = result.get("action") == "update"
+        pass3_update = result.get("pass3_text", "") if is_update else ""
 
-    cost = 0.0
-    cost += run_plan["full_research"] * avg_cost_per_full
-    cost += run_plan["condensed"] * avg_cost_per_full * condensed_ratio
-    cost += run_plan["updates"] * avg_cost_per_full * update_ratio
-    # Add summary generation cost estimate
-    cost += avg_cost_per_full * (TOKENS_SUMMARY / TOKENS_FULL)
+        prev = None
+        if prev_history and key in prev_history:
+            snaps = prev_history[key].get("snapshots", [])
+            if snaps:
+                prev = snaps[-1]
 
-    return cost
+        lines.append(build_stock_section(
+            stock, writeup, prev, is_first_run,
+            is_update=is_update, pass3_update=pass3_update,
+        ))
 
+    if not remaining_keys:
+        lines.append("*No remaining stocks.*")
 
-def build_run_plan(unique_stocks, tiers, history, is_first_run, refresh_ticker, refresh_all, tier1_only=False):
-    """Build a plan of what research actions are needed. Returns categorised counts and action map."""
-    action_map = {}  # key -> action
-    counts = {
-        "full_research": 0,
-        "condensed": 0,
-        "updates": 0,
-        "cache_only": 0,
-        "no_api": 0,
-    }
-
-    for key, stock in unique_stocks.items():
-        is_portfolio = stock["in_portfolio"]
-        is_watchlist = stock["in_watchlist"]
-
-        force = refresh_all or (refresh_ticker and stock["ticker"] == refresh_ticker)
-
-        if is_portfolio:
-            # Portfolio always gets full research
-            cache_age = get_cache_age_days(stock)
-            if force or cache_age is None or cache_age > CACHE_MAX_AGE_DAYS:
-                action_map[key] = "full"
-                counts["full_research"] += 1
-            else:
-                action_map[key] = "update"
-                counts["updates"] += 1
-
-        if is_watchlist:
-            tier = tiers.get(key, 3)
-            # In tier1-only mode, skip API calls for Tier 2/3 watchlist-only stocks
-            if tier1_only and tier > 1 and not is_portfolio:
-                action = "none"
-            elif force:
-                action = "full" if tier <= 1 else ("condensed" if tier == 2 else "none")
-            else:
-                action = determine_research_action(stock, tier, force_refresh=False)
-
-            # Don't double-count if already planned as portfolio
-            if key in action_map:
-                # Use the more thorough action
-                existing = action_map[key]
-                if _action_priority(action) > _action_priority(existing):
-                    # Adjust counts
-                    counts[_action_count_key(existing)] -= 1
-                    action_map[key] = action
-                    counts[_action_count_key(action)] += 1
-            else:
-                action_map[key] = action
-                counts[_action_count_key(action)] += 1
-
-    return counts, action_map
-
-
-def _action_priority(action):
-    """Return priority for research actions (higher = more thorough)."""
-    return {"full": 3, "condensed": 2, "update": 1, "none": 0}.get(action, 0)
-
-
-def _action_count_key(action):
-    """Map action to count key."""
-    return {
-        "full": "full_research",
-        "condensed": "condensed",
-        "update": "updates",
-        "none": "no_api",
-    }.get(action, "no_api")
-
-
-def run_trial(client, unique_stocks, tiers, history, is_first_run, delay, use_search=False):
-    """Run trial on 2 stocks. Returns total usage dict."""
-    total_usage = {"input_tokens": 0, "output_tokens": 0, "search_requests": 0}
-
-    # Pick one portfolio stock and one Tier 1 watchlist stock
-    trial_stocks = []
-
-    # Find a portfolio stock
-    for key, stock in unique_stocks.items():
-        if stock["in_portfolio"]:
-            trial_stocks.append((key, stock, "full", True))
-            break
-
-    # Find a Tier 1 watchlist stock
-    for key, stock in unique_stocks.items():
-        if stock["in_watchlist"] and tiers.get(key) == 1:
-            # Skip if already selected as portfolio stock
-            if trial_stocks and trial_stocks[0][0] == key:
-                continue
-            trial_stocks.append((key, stock, "full", False))
-            break
-
-    # If we couldn't find both, fill with whatever we can
-    if len(trial_stocks) < 2:
-        for key, stock in unique_stocks.items():
-            if len(trial_stocks) >= 2:
-                break
-            if any(t[0] == key for t in trial_stocks):
-                continue
-            trial_stocks.append((key, stock, "full", stock["in_portfolio"]))
-
-    print(f"\nRunning trial on {len(trial_stocks)} stocks...")
-
-    for i, (key, stock, action, is_portfolio) in enumerate(trial_stocks):
-        ticker = stock["ticker"]
-        name = stock["name"]
-        exchange = get_exchange_label(stock["flag"])
-        label = "full research"
-        print(f"[Trial {i+1}/{len(trial_stocks)}]  {ticker:<6s}({name}, {exchange})  [{label}]")
-
-        prev = get_previous_snapshot(history, stock)
-        try:
-            text, usage = research_stock(client, stock, action, prev,
-                                         is_first_run, is_portfolio, delay,
-                                         use_search=use_search)
-            for k in total_usage:
-                total_usage[k] += usage[k]
-        except Exception as e:
-            print(f"  Trial error: {e}")
-
-        if i < len(trial_stocks) - 1:
-            time.sleep(delay)
-
-    return total_usage, len(trial_stocks)
-
-
-# ─── Report Generation ─────────────────────────────────────────────────────────
-
-
-def generate_output_filenames():
-    """Generate output filenames with local time. Handle same-minute collision."""
-    now = local_now()
-    prefix = now.strftime("%Y-%m-%d_%H%M")
-
-    # Check for collision
-    existing = list(OUTPUT_DIR.glob(f"{prefix}_*.md"))
-    if existing:
-        prefix = prefix + "_2"
-
-    return {
-        "summary": OUTPUT_DIR / f"{prefix}_summary.md",
-        "portfolio": OUTPUT_DIR / f"{prefix}_portfolio.md",
-        "watchlist": OUTPUT_DIR / f"{prefix}_watchlist.md",
-    }
+    filepath.write_text("\n".join(lines))
+    return filepath
 
 
 def cleanup_old_outputs():
-    """Keep only the last OUTPUT_MAX_RUNS sets of output files."""
-    # Group files by their timestamp prefix
-    all_files = sorted(OUTPUT_DIR.glob("*.md"))
-    prefixes = set()
-    for f in all_files:
-        # Extract prefix: everything before _summary/_portfolio/_watchlist
-        name = f.stem
-        for suffix in ("_summary", "_portfolio", "_watchlist"):
-            if name.endswith(suffix):
-                prefixes.add(name[: -len(suffix)])
-                break
-
-    sorted_prefixes = sorted(prefixes)
-    if len(sorted_prefixes) > OUTPUT_MAX_RUNS:
-        to_delete = sorted_prefixes[: -OUTPUT_MAX_RUNS]
-        for prefix in to_delete:
-            for suffix in ("_summary", "_portfolio", "_watchlist"):
-                path = OUTPUT_DIR / f"{prefix}{suffix}.md"
-                if path.exists():
-                    path.unlink()
+    """Delete oldest output files, keeping only the last OUTPUT_MAX_RUNS."""
+    files = sorted(OUTPUT_DIR.glob("*_analysis.md"))
+    if len(files) > OUTPUT_MAX_RUNS:
+        for f in files[:-OUTPUT_MAX_RUNS]:
+            f.unlink()
 
 
-def build_portfolio_stock_section(stock, research_text, prev_snapshot, is_first_run):
-    """Build markdown section for one portfolio stock."""
+
+# ── Cost Estimation ───────────────────────────────────────────────────────────
+
+# Estimated token usage per action (conservative)
+_EST_FULL_INPUT = 2200    # avg across 3 passes (pass1 ~800, pass2 ~1500, pass3 ~500)
+_EST_FULL_OUTPUT = 2300   # avg across 3 passes (pass1 ~1500, pass2 ~500, pass3 ~300)
+_EST_FULL_SEARCHES = 1.5  # pass3 always (1) + pass2 ~50% chance (0.5)
+
+_EST_UPD_INPUT = 500
+_EST_UPD_OUTPUT = 350
+_EST_UPD_SEARCHES = 1.0   # pass3 always
+
+
+def estimate_run_cost(full_count, update_count):
+    """Estimate total cost for the planned run."""
+    full_cost = full_count * (
+        _EST_FULL_INPUT * PRICE_INPUT
+        + _EST_FULL_OUTPUT * PRICE_OUTPUT
+        + _EST_FULL_SEARCHES * PRICE_PER_SEARCH
+    )
+    update_cost = update_count * (
+        _EST_UPD_INPUT * PRICE_INPUT
+        + _EST_UPD_OUTPUT * PRICE_OUTPUT
+        + _EST_UPD_SEARCHES * PRICE_PER_SEARCH
+    )
+    return full_cost + update_cost
+
+
+# ── Mock Research (dry run) ───────────────────────────────────────────────────
+
+def generate_mock_writeup(stock, is_first_run):
+    """Return a realistic mock 8-section write-up for --dry-run mode."""
     name = stock["name"]
-    ticker = stock["ticker"]
-    exchange = get_exchange_label(stock["flag"])
-
-    # Determine recommendation from research text
-    rec = "HOLD"
-    text_upper = research_text.upper() if research_text else ""
-    if "SELL" in text_upper and "HOLD" not in text_upper:
-        rec = "SELL"
-
-    lines = [f"### {name} ({ticker} — {exchange}) — {rec}"]
-
-    # Rank deltas
-    if prev_snapshot and not is_first_run:
-        q_delta = format_rank_delta(prev_snapshot["quality_rank"], stock["quality_rank"])
-        v_delta = format_rank_delta(prev_snapshot["value_rank"], stock["value_rank"])
-        sr_delta = format_rank_delta(prev_snapshot["stock_rank"], stock["stock_rank"])
-        q_arrow = format_rank_arrow(prev_snapshot["quality_rank"], stock["quality_rank"])
-        v_arrow = format_rank_arrow(prev_snapshot["value_rank"], stock["value_rank"])
-        sr_arrow = format_rank_arrow(prev_snapshot["stock_rank"], stock["stock_rank"])
-        lines.append(f"#### Quality: {q_delta} {q_arrow} | Value: {v_delta} {v_arrow} | Stock Rank: {sr_delta} {sr_arrow}")
-    else:
-        lines.append(f"#### Quality: {stock['quality_rank']} | Value: {stock['value_rank']} | Stock Rank: {stock['stock_rank']}")
-        if is_first_run:
-            lines.append("*Baseline run — no previous data. Rank change tracking begins from next run.*")
-
-    if research_text:
-        lines.append(research_text)
-    else:
-        lines.append("*Research unavailable. Retry with: --refresh " + ticker + "*")
-
-    lines.append("\n---\n")
-    return "\n".join(lines)
-
-
-def build_watchlist_tier1_section(stock, research_text, prev_snapshot, is_first_run):
-    """Build markdown section for one Tier 1 watchlist stock."""
-    name = stock["name"]
-    ticker = stock["ticker"]
-    exchange = get_exchange_label(stock["flag"])
-
-    # Determine recommendation
-    rec = "WATCH"
-    text_upper = research_text.upper() if research_text else ""
-    if "BUY" in text_upper and "PASS" not in text_upper:
-        rec = "BUY"
-    elif "PASS" in text_upper and "BUY" not in text_upper:
-        rec = "PASS"
-
-    lines = [f"### {name} ({ticker} — {exchange}) — {rec}"]
-
-    if prev_snapshot and not is_first_run:
-        q_delta = format_rank_delta(prev_snapshot["quality_rank"], stock["quality_rank"])
-        v_delta = format_rank_delta(prev_snapshot["value_rank"], stock["value_rank"])
-        qv_delta = format_rank_delta(prev_snapshot["qv_rank"], stock["qv_rank"])
-        lines.append(f"#### Quality: {q_delta} | Value: {v_delta} | QV: {qv_delta} | {stock['stockrank_style']}")
-    else:
-        lines.append(f"#### Quality: {stock['quality_rank']} | Value: {stock['value_rank']} | QV: {stock['qv_rank']} | {stock['stockrank_style']}")
-        if is_first_run:
-            lines.append("*Baseline run — no previous data. Rank change tracking begins from next run.*")
-
-    if research_text:
-        lines.append(research_text)
-    else:
-        lines.append(f"*Research unavailable due to API error. Retry with: --refresh {ticker}*")
-
-    lines.append("\n---\n")
-    return "\n".join(lines)
-
-
-def build_watchlist_tier2_section(stock, research_text, prev_snapshot, is_first_run):
-    """Build markdown section for one Tier 2 watchlist stock."""
-    name = stock["name"]
-    ticker = stock["ticker"]
-    exchange = get_exchange_label(stock["flag"])
-
-    rec = "WATCH"
-    text_upper = research_text.upper() if research_text else ""
-    if "PASS" in text_upper:
-        rec = "PASS"
-
-    lines = [f"### {name} ({ticker} — {exchange}) — {rec}"]
-    lines.append(f"#### Quality: {stock['quality_rank']} | Value: {stock['value_rank']} | QV: {stock['qv_rank']}")
-
-    if is_first_run:
-        lines.append("*Baseline run — no previous data. Rank change tracking begins from next run.*")
-
-    if research_text:
-        lines.append(research_text)
-    else:
-        cached = read_cache(stock)
-        if cached:
-            # Extract last update or summary
-            lines.append(cached[-500:] if len(cached) > 500 else cached)
-        else:
-            lines.append(f"*No research available. Retry with: --refresh {ticker}*")
-
-    lines.append("\n---\n")
-    return "\n".join(lines)
-
-
-def build_watchlist_tier3_line(stock):
-    """Build one-line summary for Tier 3 stock from cache."""
-    name = stock["name"]
-    ticker = stock["ticker"]
-    style = stock["stockrank_style"]
+    q = stock["quality_rank"]
+    v = stock["value_rank"]
+    m = stock["momentum_rank"]
     qv = stock["qv_rank"]
+    style = stock["stockrank_style"]
+    sector = stock["sector"]
+    mkt = stock["mkt_cap"]
+    flag = stock["flag"]
+    currency = "GBP" if flag == "gb" else "USD"
+    exchange = get_exchange_label(flag)
 
-    cached = read_cache(stock)
-    summary = "No cached research available."
-    if cached:
-        # Extract first meaningful sentence from cache
-        for line in cached.split("\n"):
-            line = line.strip()
-            if line and not line.startswith("#") and not line.startswith("*") and len(line) > 20:
-                summary = line[:150]
-                if len(line) > 150:
-                    summary += "..."
-                break
-
-    return f"### {name} ({ticker}) — {style} | QV: {qv}\n{summary}\n"
-
-
-def generate_summary_file(filepath, unique_stocks, tiers, research_results,
-                          history, is_first_run, screen_name, prev_history):
-    """Generate the summary markdown file."""
-    now_local = local_now()
-    now_utc = utc_now()
-
-    lines = [
-        "# Stock Analysis — Daily Summary",
-        f"## {now_local.strftime('%A %d %B %Y')} {now_local.strftime('%H:%M')} (UTC: {now_utc.strftime('%Y-%m-%d %H:%M')})",
-        "",
-    ]
-
-    # Today's Rank Movers — Tier 1 watchlist only
-    lines.append("## Today's Rank Movers — Act Now")
-    tier1_stocks = []
-    for key, stock in unique_stocks.items():
-        if stock["in_watchlist"] and tiers.get(key) == 1:
-            prev = None
-            prev_key = f"{stock['flag']}_{stock['ticker']}"
-            if prev_history and prev_key in prev_history and prev_history[prev_key]["snapshots"]:
-                prev = prev_history[prev_key]["snapshots"][-1]
-            tier1_stocks.append((key, stock, prev))
-
-    # Sort by QV delta descending
-    def qv_sort_key(item):
-        _, stock, prev = item
-        if prev and not is_first_run:
-            return stock["qv_rank"] - prev["qv_rank"]
-        return stock["qv_rank"]
-
-    tier1_stocks.sort(key=qv_sort_key, reverse=True)
-
-    if not tier1_stocks:
-        lines.append("*No significant rank movers today.*\n")
+    if qv >= 90:
+        rec = "Buy"
+    elif qv < 50:
+        rec = "Sell"
     else:
-        for key, stock, prev in tier1_stocks:
-            exchange = get_exchange_label(stock["flag"])
-            if prev and not is_first_run:
-                qv_str = format_rank_delta(prev["qv_rank"], stock["qv_rank"])
-            else:
-                qv_str = str(stock["qv_rank"])
-            style = stock["stockrank_style"]
+        rec = "Watch"
 
-            # Get one-line summary from research
-            research = research_results.get(key, "")
-            one_line = ""
-            if research:
-                for sent in research.split(". "):
-                    sent = sent.strip()
-                    if len(sent) > 30:
-                        one_line = sent.rstrip(".") + "."
-                        break
-            if not one_line:
-                one_line = "Research pending."
+    baseline = (
+        "Baseline run — no previous snapshot data. "
+        "Rank change tracking begins from next run. "
+    ) if is_first_run else ""
 
-            lines.append(f"**{stock['name']}** ({stock['ticker']}, {exchange}) | QV: {qv_str} | {style}")
-            lines.append(f"  {one_line}\n")
+    return f"""**1. Stockopedia Rank Sense-Check**
 
-    # Portfolio Flags
-    lines.append("## Portfolio Flags")
-    portfolio_flags = []
-    for key, stock in unique_stocks.items():
-        if not stock["in_portfolio"]:
-            continue
-        prev_key = f"{stock['flag']}_{stock['ticker']}"
-        if prev_history and prev_key in prev_history and prev_history[prev_key]["snapshots"]:
-            prev = prev_history[prev_key]["snapshots"][-1]
-            sr_delta = stock["stock_rank"] - prev["stock_rank"]
-            qv_delta = stock["qv_rank"] - prev["qv_rank"]
-            if abs(sr_delta) >= 5 or abs(qv_delta) >= 5:
-                direction = "improving" if qv_delta > 0 else "deteriorating"
-                portfolio_flags.append(
-                    f"**{stock['name']}** ({stock['ticker']}): "
-                    f"Stock Rank {format_rank_delta(prev['stock_rank'], stock['stock_rank'])}, "
-                    f"QV {format_rank_delta(prev['qv_rank'], stock['qv_rank'])} — {direction}"
-                )
+{baseline}The Quality Rank of {q} and Value Rank of {v} for {name} appear broadly consistent with the company's fundamental position in the {sector} sector. The {style} classification from Stockopedia reflects a business where quality and value metrics appear to be genuinely complementary rather than temporarily inflated by one-off items, though a deeper review of the latest accounts would be needed to confirm.
 
-    if portfolio_flags:
-        lines.extend(portfolio_flags)
-    else:
-        lines.append("*No material rank moves in portfolio since last run.*")
-    lines.append("")
+**2. Current Company Narrative**
 
-    # Since Last Run
-    lines.append("## Since Last Run")
-    if is_first_run:
-        lines.append("*Baseline run — all stocks recorded for the first time.*")
-    else:
-        changes = []
-        # Check for style changes
-        for key, stock in unique_stocks.items():
-            prev_key = f"{stock['flag']}_{stock['ticker']}"
-            if prev_history and prev_key in prev_history and prev_history[prev_key]["snapshots"]:
-                prev = prev_history[prev_key]["snapshots"][-1]
-                if prev.get("stockrank_style") != stock["stockrank_style"]:
-                    changes.append(
-                        f"**{stock['name']}** style changed: {prev.get('stockrank_style', '?')} → {stock['stockrank_style']}"
-                    )
-        if changes:
-            lines.extend(changes)
-        else:
-            lines.append("*No material changes since last run.*")
-    lines.append("")
+{name} operates in the {sector} sector with a market capitalisation of {mkt}m {currency} on the {exchange}. Recent trading has been broadly in line with market expectations, with management maintaining guidance for the current financial year. No material strategic pivots or significant management changes have been announced in the period under review.
 
-    # Executive Summary placeholder
-    lines.append("## Executive Summary")
-    lines.append(f"This analysis covers a portfolio and the {screen_name} watchlist screen. ")
-    if is_first_run:
-        lines.append("This is the baseline run establishing rank history for future comparison. "
-                      "All stocks have been researched and cached. From the next run onwards, "
-                      "the system will track rank changes and focus research on the top movers.")
-    else:
-        t1_count = sum(1 for t in tiers.values() if t == 1)
-        t2_count = sum(1 for t in tiers.values() if t == 2)
-        t3_count = sum(1 for t in tiers.values() if t == 3)
-        lines.append(f"Today's run identified {t1_count} Tier 1 stocks for full research, "
-                      f"{t2_count} Tier 2 stocks for condensed review, and {t3_count} Tier 3 stocks on the radar.")
-    lines.append("")
+**3. Multibagger Potential**
 
-    filepath.write_text("\n".join(lines))
+The bull case for {name} rests on three credible pillars. Revenue growth looks achievable as the company expands its addressable market within the {sector} space, where structural tailwinds remain supportive. Margin expansion is plausible through operational leverage as fixed costs are spread across a growing revenue base. At a QV Rank of {qv}, the current valuation appears undemanding relative to quality peers, leaving room for a meaningful multiple re-rating as earnings quality becomes more widely recognised.
+
+**4. Bear Case**
+
+The two most credible risks for {name} are sector-specific regulatory or competitive headwinds that could compress margins without warning, and the liquidity risk inherent in a {mkt}m {currency} market capitalisation where the bid-offer spread can widen sharply in volatile conditions. A third risk is execution: the strategic plan is ambitious, and any shortfall against guidance at the next results announcement would likely be penalised disproportionately given current market sentiment.
+
+**5. ESG and Sustainability**
+
+{name} operates within the typical ESG norms for the {sector} peer group. No material controversies have emerged in recent periods that would represent a differentiating risk factor. Governance appears adequate with no obvious red flags in board composition or remuneration structures, and the ESG trajectory appears broadly stable to improving.
+
+**6. Financial Health Red Flags**
+
+No material financial health red flags are apparent from the available data. The balance sheet appears clean with no unusual debt structures or recent dilutive equity raises flagged, and cash flow generation appears adequate relative to stated obligations.
+
+**7. Latest Updates**
+
+No material official announcements have been identified for {name} in the last six months based on available information. [Dry run — no web search performed.]
+
+**8. Final Assessment — Buy / Watch / Sell**
+
+{rec}. {name} presents a {'compelling case for inclusion at current levels' if rec == 'Buy' else ('reasonable case for monitoring ahead of a potential entry' if rec == 'Watch' else 'deteriorating picture that warrants caution')}. With a QV Rank of {qv} and a {style} classification, the stock {'offers an attractive risk-reward profile for investors willing to accept the liquidity constraints of a smaller company' if rec == 'Buy' else ('warrants a watching brief pending further rank improvement or a clearer fundamental catalyst' if rec == 'Watch' else 'shows rank deterioration sufficient to justify a re-evaluation of the investment thesis')}."""
 
 
-def generate_portfolio_file(filepath, unique_stocks, research_results,
-                            history, is_first_run, prev_history):
-    """Generate the portfolio markdown file."""
-    now_local = local_now()
-    now_utc = utc_now()
-
-    lines = [
-        "# Stock Analysis — Portfolio Holdings",
-        f"## {now_local.strftime('%A %d %B %Y')} {now_local.strftime('%H:%M')} (UTC: {now_utc.strftime('%Y-%m-%d %H:%M')})",
-        "",
-    ]
-
-    portfolio_stocks = [(k, s) for k, s in unique_stocks.items() if s["in_portfolio"]]
-    portfolio_stocks.sort(key=lambda x: x[1]["stock_rank"], reverse=True)
-
-    for key, stock in portfolio_stocks:
-        prev = None
-        prev_key = f"{stock['flag']}_{stock['ticker']}"
-        if prev_history and prev_key in prev_history and prev_history[prev_key]["snapshots"]:
-            prev = prev_history[prev_key]["snapshots"][-1]
-
-        research = research_results.get(key, "")
-        section = build_portfolio_stock_section(stock, research, prev, is_first_run)
-        lines.append(section)
-
-    filepath.write_text("\n".join(lines))
-
-
-def generate_watchlist_file(filepath, unique_stocks, tiers, research_results,
-                            history, is_first_run, screen_name, prev_history):
-    """Generate the watchlist markdown file."""
-    now_local = local_now()
-    now_utc = utc_now()
-
-    lines = [
-        f"# Stock Analysis — Watchlist: {screen_name}",
-        f"## {now_local.strftime('%A %d %B %Y')} {now_local.strftime('%H:%M')} (UTC: {now_utc.strftime('%Y-%m-%d %H:%M')})",
-        "",
-    ]
-
-    watchlist_stocks = {k: s for k, s in unique_stocks.items() if s["in_watchlist"]}
-
-    # ── Tier 1 ──
-    lines.append("---")
-    lines.append("## Tier 1 — Top Rank Movers (Full Research)\n")
-
-    tier1 = [(k, s) for k, s in watchlist_stocks.items() if tiers.get(k) == 1]
-    # Sort by QV delta descending
-    def t1_sort(item):
-        k, s = item
-        prev_key = f"{s['flag']}_{s['ticker']}"
-        if prev_history and prev_key in prev_history and prev_history[prev_key]["snapshots"]:
-            prev = prev_history[prev_key]["snapshots"][-1]
-            return s["qv_rank"] - prev["qv_rank"]
-        return s["qv_rank"]
-
-    tier1.sort(key=t1_sort, reverse=True)
-
-    for key, stock in tier1:
-        prev = None
-        prev_key = f"{stock['flag']}_{stock['ticker']}"
-        if prev_history and prev_key in prev_history and prev_history[prev_key]["snapshots"]:
-            prev = prev_history[prev_key]["snapshots"][-1]
-        research = research_results.get(key, "")
-        lines.append(build_watchlist_tier1_section(stock, research, prev, is_first_run))
-
-    if not tier1:
-        lines.append("*No Tier 1 stocks this run.*\n")
-
-    # ── Tier 2 ──
-    lines.append("---")
-    lines.append("## Tier 2 — Strong and Stable (Condensed)\n")
-
-    tier2 = [(k, s) for k, s in watchlist_stocks.items() if tiers.get(k) == 2]
-    tier2.sort(key=lambda x: x[1]["qv_rank"], reverse=True)
-
-    for key, stock in tier2:
-        prev = None
-        prev_key = f"{stock['flag']}_{stock['ticker']}"
-        if prev_history and prev_key in prev_history and prev_history[prev_key]["snapshots"]:
-            prev = prev_history[prev_key]["snapshots"][-1]
-        research = research_results.get(key, "")
-        lines.append(build_watchlist_tier2_section(stock, research, prev, is_first_run))
-
-    if not tier2:
-        lines.append("*No Tier 2 stocks this run.*\n")
-
-    # ── Tier 3 ──
-    lines.append("---")
-    lines.append("## Tier 3 — On the Radar\n")
-
-    tier3 = [(k, s) for k, s in watchlist_stocks.items() if tiers.get(k) == 3]
-    tier3.sort(key=lambda x: x[1]["stock_rank"], reverse=True)
-
-    for key, stock in tier3:
-        lines.append(build_watchlist_tier3_line(stock))
-
-    if not tier3:
-        lines.append("*No Tier 3 stocks this run.*\n")
-
-    filepath.write_text("\n".join(lines))
-
-
-# ─── CLI & Main ─────────────────────────────────────────────────────────────────
-
+# ── CLI Argument Parsing ──────────────────────────────────────────────────────
 
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Stock Portfolio & Watchlist Analyzer",
+        description="Stock Research Engine — single CSV, three-pass AI research",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python analyze.py --stocks my_stocks.csv
+  python analyze.py --stocks my_stocks.csv --top 3
+  python analyze.py --stocks my_stocks.csv --refresh ING
+  python analyze.py --stocks my_stocks.csv --refresh-all
+  python analyze.py --stocks my_stocks.csv --max-cost 1.00
+  python analyze.py --stocks my_stocks.csv --skip-trial
+  python analyze.py --stocks my_stocks.csv --delay 3
+  python analyze.py --stocks my_stocks.csv --dry-run
+""",
     )
-    parser.add_argument("--portfolio", required=True, help="Path to portfolio CSV")
-    parser.add_argument("--watchlist", required=True, help="Path to watchlist CSV")
+    parser.add_argument("--stocks", required=True,
+                        help="Path to Stockopedia CSV export")
     parser.add_argument("--top", type=int, default=5,
-                        help="Number of top QV rank improvers for Tier 1 (default: 5)")
-    parser.add_argument("--skip-trial", action="store_true",
-                        help="Skip trial mode for repeat same-day runs")
-    parser.add_argument("--max-cost", type=float, default=2.00,
-                        help="Maximum cost cap in USD (default: $2.00)")
-    parser.add_argument("--refresh", type=str, default=None,
-                        help="Force refresh a single stock by ticker")
+                        help="Tier 1 size — number of top QV movers (default: 5)")
+    parser.add_argument("--refresh", type=str, default=None, metavar="TICKER",
+                        help="Force full three-pass refresh for one stock")
     parser.add_argument("--refresh-all", action="store_true",
-                        help="Force refresh all stocks")
+                        help="Force full three-pass refresh for every stock")
+    parser.add_argument("--max-cost", type=float, default=2.00,
+                        help="Hard cost cap in USD (default: $2.00)")
+    parser.add_argument("--skip-trial", action="store_true",
+                        help="Skip the cost confirmation prompt")
     parser.add_argument("--delay", type=float, default=2.0,
-                        help="Delay between API calls in seconds (default: 2)")
+                        help="Seconds between API calls (default: 2)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Generate reports with mock data (no API key needed)")
-    parser.add_argument("--tier1-only", action="store_true",
-                        help="Only research portfolio + Tier 1 watchlist stocks (skip Tier 2/3 API calls)")
-    parser.add_argument("--with-search", action="store_true",
-                        help="Enable live web search (uses Sonnet, slower and costlier)")
+                        help="Generate report with mock data — no API calls, no cost")
     return parser.parse_args()
 
 
-def generate_mock_research(stock, action, is_portfolio):
-    """Generate realistic mock research text for --dry-run mode."""
-    name = stock["name"]
-    sector = stock["sector"]
-    style = stock["stockrank_style"]
-    qv = stock["qv_rank"]
-    quality = stock["quality_rank"]
-    value = stock["value_rank"]
-    risk = stock["risk_rating"]
-    mkt_cap = stock["mkt_cap"]
-    currency = "GBP" if stock["flag"] == "gb" else "USD"
 
-    if action == "none":
-        return f"{name} remains on the radar with a {style} profile. No material developments."
-
-    if action == "condensed":
-        return (
-            f"{name} carries a QV Rank of {qv}, reflecting a Quality score of {quality} "
-            f"and Value score of {value}. The {sector} company trades at a market capitalisation "
-            f"of {mkt_cap}m {currency} and holds a {risk} risk rating. "
-            f"The ranks appear broadly justified by the company's fundamentals, with no obvious "
-            f"distortions from one-off events. The bull case rests on potential margin expansion "
-            f"as the business scales, combined with what looks like genuine undervaluation relative "
-            f"to quality peers in the {sector} space. However, at this stage the catalysts for a "
-            f"re-rating remain uncertain, and the stock warrants monitoring rather than immediate action. "
-            f"WATCH — ranks are solid but a clearer catalyst is needed before committing capital."
-        )
-
-    # Full research
-    if is_portfolio:
-        rec = "HOLD"
-        rec_text = (
-            f"HOLD. {name} continues to justify its place in the portfolio. The Quality Rank of "
-            f"{quality} reflects genuine operational strength, and the Value Rank of {value} suggests "
-            f"the market has not yet fully priced in the company's quality. The {style} classification "
-            f"and overall QV Rank of {qv} reinforce the investment thesis. No deterioration in ranks "
-            f"that would trigger a sell signal."
-        )
-    else:
-        rec = "BUY" if qv >= 90 else "WATCH"
-        if rec == "BUY":
-            rec_text = (
-                f"BUY. The QV Rank of {qv} represents a compelling entry signal. Quality and Value "
-                f"are both elevated, Momentum has not yet caught up, and the narrative supports a "
-                f"credible re-rating story. The {risk} risk profile is acceptable given the upside potential."
-            )
-        else:
-            rec_text = (
-                f"WATCH. The QV Rank of {qv} is encouraging but not yet compelling enough for immediate "
-                f"action. Quality at {quality} is solid, but the Value score of {value} suggests the market "
-                f"may already be partially pricing in the quality. Monitor for further rank improvement."
-            )
-
-    return (
-        f"The Quality Rank of {quality} and Value Rank of {value} for {name} appear well-supported by "
-        f"the company's underlying fundamentals. Operating in the {sector} sector with a market cap of "
-        f"{mkt_cap}m {currency}, the company has demonstrated consistent execution. The {style} "
-        f"classification from Stockopedia aligns with what we see in the financials — this is a business "
-        f"where quality metrics are genuinely strong rather than artificially inflated by one-off items.\n\n"
-        f"Over the past three to six months, {name} has continued to execute against its strategic plan. "
-        f"Recent trading updates have been broadly in line with expectations, with management maintaining "
-        f"guidance. The {sector} sector has seen mixed conditions, but {name} has navigated these "
-        f"effectively, suggesting operational resilience that justifies the elevated Quality Rank.\n\n"
-        f"The multibagger case for {name} rests on three pillars. First, revenue growth potential looks "
-        f"credible as the company expands its addressable market. Second, there is a realistic path to "
-        f"margin expansion through operational leverage as fixed costs are spread across a growing revenue "
-        f"base. Third, the valuation remains undemanding relative to quality — the market appears to be "
-        f"applying a discount that does not reflect the company's true earnings power.\n\n"
-        f"The bear case centres on two specific risks. The {sector} sector faces potential headwinds from "
-        f"regulatory changes that could compress margins. Additionally, the company's relatively modest "
-        f"market capitalisation of {mkt_cap}m {currency} means liquidity risk in a downturn is real — "
-        f"the bid-offer spread can widen significantly during periods of market stress.\n\n"
-        f"From an ESG perspective, {name} operates within the norms for its {sector} peer group. "
-        f"No material controversies have emerged recently. Governance appears adequate with no red flags "
-        f"in board composition or executive compensation structures.\n\n"
-        f"No financial health red flags are apparent. The balance sheet looks clean with manageable debt "
-        f"levels and adequate cash flow generation. No recent dilution or unusual financing activity.\n\n"
-        f"{rec_text}"
-    )
-
+# ── Main Entry Point ──────────────────────────────────────────────────────────
 
 def main():
-    """Main entry point."""
-    print("Stock Portfolio & Watchlist Analyzer")
-    print("=" * 37)
-
-    # Check Python version
-    print(f"Python {sys.version_info.major}.{sys.version_info.minor}+ check: OK")
+    print("Stock Research Engine")
+    print("=" * 21)
+    print(f"Python {sys.version_info.major}.{sys.version_info.minor}: OK")
 
     args = parse_args()
     dry_run = args.dry_run
 
-    # Check API key: try environment variable first, then .env file
+    # ── API key ───────────────────────────────────────────────────────────────
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         env_file = BASE_DIR / ".env"
@@ -1353,120 +999,102 @@ def main():
     if not api_key and not dry_run:
         sys.exit(
             "Error: Anthropic API key not found.\n\n"
-            "Option 1 — Create a .env file in the project folder:\n"
-            f"  {BASE_DIR / '.env'}\n"
-            "  with the line: ANTHROPIC_API_KEY=sk-ant-your-key-here\n\n"
-            "Option 2 — Set an environment variable:\n"
+            f"Option 1 — Create {BASE_DIR / '.env'} containing:\n"
+            "  ANTHROPIC_API_KEY=sk-ant-your-key-here\n\n"
+            "Option 2 — Set environment variable:\n"
             "  export ANTHROPIC_API_KEY='sk-ant-your-key-here'"
         )
 
     if dry_run:
-        print("MODE: Dry run (mock data, no API calls)")
+        print("MODE: Dry run (mock data, no API calls, $0.00 cost)")
 
-    # Ensure directories exist
-    print("Creating directories...", end=" ", flush=True)
+    # ── Directories ───────────────────────────────────────────────────────────
     ensure_dirs()
-    print("OK")
 
-    # Load and validate CSVs
-    print("Validating CSVs...", end=" ", flush=True)
-    portfolio_df, watchlist_df, unique_stocks = load_stocks(args.portfolio, args.watchlist)
+    # ── Load CSV ──────────────────────────────────────────────────────────────
+    print(f"\nLoading {args.stocks}...", end=" ", flush=True)
+    stocks_list = load_stocks(args.stocks)
+    print(f"OK — {len(stocks_list)} stocks")
 
-    # Derive screen name from watchlist filename
-    screen_name = derive_screen_name(args.watchlist)
-    print(f"Screen name: {screen_name}")
+    if len(stocks_list) == 0:
+        sys.exit("Error: CSV contains no valid stock rows.")
 
-    # Load history
+    # ── History ───────────────────────────────────────────────────────────────
     print("Loading rank history...", end=" ", flush=True)
     history = load_history()
-    prev_history = json.loads(json.dumps(history)) if history else None  # deep copy
+    # Deep copy for comparison (before this run's snapshots are added)
+    prev_history = json.loads(json.dumps(history))
     is_first_run = len(history) == 0
-    print(f"{'No history found (first run)' if is_first_run else f'{len(history)} stocks in history'}")
-
-    print(f"Timezone: Europe/London (all internal timestamps in UTC)")
-
-    # Assign tiers
-    print("Assigning watchlist tiers...", end=" ", flush=True)
-    tiers = assign_tiers(unique_stocks, history, args.top, is_first_run)
-    print("done")
-
-    # Print tier breakdown
-    t1_count = sum(1 for t in tiers.values() if t == 1)
-    t2_count = sum(1 for t in tiers.values() if t == 2)
-    t3_count = sum(1 for t in tiers.values() if t == 3)
-
     if is_first_run:
-        print(f"\nFirst run — no history available. Using absolute QV ranks for tier assignment.")
+        print("no history found (baseline run)")
     else:
-        last_ts = None
-        for entry in history.values():
-            if entry["snapshots"]:
-                ts = entry["snapshots"][-1]["timestamp_utc"]
-                if last_ts is None or ts > last_ts:
-                    last_ts = ts
-        print(f"\nRank change analysis (vs last run {last_ts or 'unknown'}):")
+        print(f"{len(history)} stocks in history")
 
-    print(f"  Tier 1 (top {args.top} by QV improvement):    {t1_count} stocks  <- today's focus")
-    print(f"  Tier 2 (QV rank > {TIER2_QV_THRESHOLD}, stable):       {t2_count} stocks")
-    print(f"  Tier 3 (everything else):            {t3_count} stocks")
-
-    # Build run plan
-    print("\nBuilding run plan...", end=" ", flush=True)
-    counts, action_map = build_run_plan(
-        unique_stocks, tiers, history, is_first_run,
-        args.refresh, args.refresh_all, tier1_only=args.tier1_only
+    # ── Compute ordering (Tier 1 / Remaining) ─────────────────────────────────
+    tier1_keys, remaining_keys = compute_tiers(
+        stocks_list, prev_history, is_first_run, args.top
     )
-    print("done")
-    print(f"  Full research:     {counts['full_research']}")
-    print(f"  Condensed:         {counts['condensed']}")
-    print(f"  Lightweight update:{counts['updates']}")
-    print(f"  No API call:       {counts['no_api']}")
 
-    # Initialize API client (skip for dry run)
+    print(f"\nOrdering:")
+    print(f"  Tier 1 — top {args.top} QV {'by absolute QV (baseline)' if is_first_run else 'movers'}:  "
+          f"{len(tier1_keys)} stocks")
+    print(f"  Remaining — by QV rank desc:                     {len(remaining_keys)} stocks")
+
+    if not is_first_run:
+        last_ts = max(
+            (s["snapshots"][-1]["timestamp_utc"]
+             for s in prev_history.values() if s.get("snapshots")),
+            default="unknown",
+        )
+        print(f"  Comparing vs last snapshot: {last_ts}")
+
+    # ── Build action map ──────────────────────────────────────────────────────
+    action_map = {}
+    for key, stock in stocks_list.items():
+        force = args.refresh_all or (
+            args.refresh is not None and stock["ticker"] == args.refresh
+        )
+        action_map[key] = determine_action(stock, force)
+
+    full_count = sum(1 for a in action_map.values() if a == "full")
+    update_count = sum(1 for a in action_map.values() if a == "update")
+
+    print(f"\nRun plan:")
+    print(f"  Full research  (3 passes — Pass 1 + conditional Pass 2 + Pass 3):  {full_count} stocks")
+    print(f"  Update only    (Pass 3 — Latest Updates only):                      {update_count} stocks")
+
+    # ── Cost estimate ─────────────────────────────────────────────────────────
+    if not dry_run:
+        est = estimate_run_cost(full_count, update_count)
+        print(f"\nEstimated cost:  ~${est:.2f}  (cap: ${args.max_cost:.2f})")
+        print(f"  Full research stocks:   {full_count} × ~${_EST_FULL_INPUT * PRICE_INPUT + _EST_FULL_OUTPUT * PRICE_OUTPUT + _EST_FULL_SEARCHES * PRICE_PER_SEARCH:.3f} each")
+        print(f"  Update-only stocks:     {update_count} × ~${_EST_UPD_INPUT * PRICE_INPUT + _EST_UPD_OUTPUT * PRICE_OUTPUT + _EST_UPD_SEARCHES * PRICE_PER_SEARCH:.3f} each")
+
+        if est > args.max_cost:
+            sys.exit(
+                f"\nEstimated cost (${est:.2f}) exceeds the cap (${args.max_cost:.2f}).\n"
+                f"To run a subset: --refresh TICKER\n"
+                f"To raise the cap: --max-cost {est + 0.50:.2f}"
+            )
+
+        if not args.skip_trial:
+            try:
+                resp = input("\nProceed? (y/n): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                return
+            if resp != "y":
+                print("Aborted.")
+                return
+
+    # ── Initialise API client ─────────────────────────────────────────────────
     client = None
     if not dry_run:
-        print("\nInitialising API client...", end=" ", flush=True)
         client = anthropic.Anthropic(api_key=api_key)
-        print("OK")
 
-    # Trial mode (skip for dry run)
-    if not dry_run and not args.skip_trial:
-        trial_usage, trial_count = run_trial(
-            client, unique_stocks, tiers, history, is_first_run, args.delay
-        )
-        trial_cost = calculate_cost(trial_usage)
-
-        print(f"\nTrial complete ({trial_count} stocks researched).")
-        print(f"Actual cost for {trial_count} stocks: ${trial_cost:.2f}")
-
-        estimated_cost = estimate_full_run_cost(trial_usage, trial_count, counts)
-
-        portfolio_full = sum(1 for k, s in unique_stocks.items()
-                            if s["in_portfolio"] and action_map.get(k) == "full")
-
-        print(f"\nFull run breakdown:")
-        print(f"  Portfolio full research:    {portfolio_full} stocks")
-        print(f"  Tier 1 full research:        {t1_count} stocks  (top {args.top} by QV rank improvement)")
-        print(f"  Tier 2 condensed:           {counts['condensed']} stocks")
-        print(f"  Tier 3 no API call:         {counts['no_api']} stocks")
-        print(f"  Lightweight cache updates:   {counts['updates']} stocks")
-        cache_count = sum(1 for k, a in action_map.items() if a == "none")
-        print(f"  Served from cache:          {cache_count} stocks")
-        print(f"\nEstimated full run cost: ~${estimated_cost:.2f}")
-        print(f"Cost cap: ${args.max_cost:.2f}")
-
-        if estimated_cost > args.max_cost:
-            sys.exit(f"\nEstimated cost (${estimated_cost:.2f}) exceeds cap (${args.max_cost:.2f}).\n"
-                     f"Use --refresh TICKER for individual stocks or increase --max-cost.")
-
-        response = input("\nProceed with full run? (y/n): ").strip().lower()
-        if response != "y":
-            print("Aborted.")
-            return
-
-    # ── Full run ────────────────────────────────────────────────────────────────
+    # ── Research loop ─────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"{'DRY RUN' if dry_run else 'FULL RUN'} — Processing {len(unique_stocks)} unique stocks")
+    print(f"{'DRY RUN' if dry_run else 'FULL RUN'} — {len(stocks_list)} stocks")
     print(f"{'=' * 60}\n")
 
     research_results = {}
@@ -1475,137 +1103,152 @@ def main():
     failed = 0
     failed_tickers = []
 
-    # Build ordered list: portfolio first, then watchlist by tier
-    process_order = []
-    for key, stock in unique_stocks.items():
-        if stock["in_portfolio"]:
-            process_order.append(key)
-    for tier_num in [1, 2, 3]:
-        for key, stock in unique_stocks.items():
-            if stock["in_watchlist"] and tiers.get(key) == tier_num:
-                if key not in process_order:
-                    process_order.append(key)
+    all_keys = tier1_keys + remaining_keys  # process in output order
+    total = len(all_keys)
 
-    total_to_process = len(process_order)
-
-    for i, key in enumerate(process_order):
-        stock = unique_stocks[key]
-        action = action_map.get(key, "none")
+    for i, key in enumerate(all_keys):
+        stock = stocks_list[key]
+        action = action_map[key]
         ticker = stock["ticker"]
         name = stock["name"]
         exchange = get_exchange_label(stock["flag"])
-        tier = tiers.get(key, "-")
-        is_portfolio = stock["in_portfolio"]
+        label = "full research" if action == "full" else "update (Pass 3 only)"
 
-        # Build progress label
-        if is_portfolio:
-            tier_label = "portfolio — full"
-        elif action == "full":
-            tier_label = f"Tier {tier} — full"
-            prev_key = f"{stock['flag']}_{stock['ticker']}"
-            if prev_history and prev_key in prev_history and prev_history[prev_key]["snapshots"]:
-                prev = prev_history[prev_key]["snapshots"][-1]
-                qv_d = stock["qv_rank"] - prev["qv_rank"]
-                tier_label += f"  QV: {prev['qv_rank']}->{stock['qv_rank']} ({'+' if qv_d > 0 else ''}{qv_d})"
-        elif action == "condensed":
-            tier_label = f"Tier {tier} — condensed"
-        elif action == "update":
-            tier_label = "cache update"
-        else:
-            tier_label = "cache"
+        print(f"[{i+1}/{total}]  {ticker:<8s}({name}, {exchange})  [{label}]")
 
-        print(f"[{i+1}/{total_to_process}]  {ticker:<6s}({name}, {exchange})  [{tier_label}]", end="", flush=True)
-
-        if action == "none":
-            cached = read_cache(stock)
-            if cached:
-                research_results[key] = cached
-                print("  -> served from cache")
-            else:
-                print("  -> no cache (Tier 3, skipped)")
-            succeeded += 1
-            continue
-
+        # ── Dry run: generate mock data ───────────────────────────────────────
         if dry_run:
-            # Generate mock research
-            text = generate_mock_research(stock, action, is_portfolio)
-            research_results[key] = text
-            # Write to cache for dry run too
-            timestamp = utc_now().strftime("%Y-%m-%d")
-            header = f"# {name} ({ticker} — {exchange})\n## Research — {timestamp} UTC\n\n"
-            write_cache(stock, header + text)
-            print(f"  -> mock {action} research generated")
+            writeup = generate_mock_writeup(stock, is_first_run)
+            ts = utc_now().strftime("%Y-%m-%d")
+            header = (f"# {name} ({ticker} — {exchange})\n"
+                      f"## Research — {ts} UTC\n\n")
+            write_cache(stock, header + writeup)
+            research_results[key] = {
+                "action": action,
+                "writeup": writeup,
+                "pass3_text": "",
+                "pass2_triggered": False,
+                "error": False,
+            }
+            print(f"       [dry run — mock write-up generated]")
             succeeded += 1
             continue
 
-        prev = get_previous_snapshot(history, stock)
+        # ── Live research ─────────────────────────────────────────────────────
+        prev = get_prev_snapshot(prev_history, stock)
 
-        print(f"  -> calling API...", end="", flush=True)
         try:
-            text, usage = research_stock(
-                client, stock, action, prev,
-                is_first_run, is_portfolio, args.delay,
-                use_search=args.with_search
-            )
-            research_results[key] = text
-            cost = calculate_cost(usage)
-            for k in total_usage:
-                total_usage[k] += usage[k]
+            if action == "full":
+                p1, p2, p3, usage, p2_triggered = run_full_research(
+                    client, stock, prev, is_first_run, args.delay
+                )
+                writeup = assemble_full_writeup(p1, p2, p3)
+
+                # Write full write-up to cache
+                ts = utc_now().strftime("%Y-%m-%d")
+                header = (f"# {name} ({ticker} — {exchange})\n"
+                          f"## Research — {ts} UTC\n\n")
+                write_cache(stock, header + writeup)
+
+                research_results[key] = {
+                    "action": "full",
+                    "writeup": writeup,
+                    "pass3_text": "",
+                    "pass2_triggered": p2_triggered,
+                    "error": False,
+                }
+                add_usage(total_usage, usage)
+
+            else:  # update
+                cached = read_cache(stock)
+                if not cached:
+                    # Cache missing despite "update" decision — run full instead
+                    print(f"       No cache found — upgrading to full research")
+                    p1, p2, p3, usage, p2_triggered = run_full_research(
+                        client, stock, prev, is_first_run, args.delay
+                    )
+                    writeup = assemble_full_writeup(p1, p2, p3)
+                    ts = utc_now().strftime("%Y-%m-%d")
+                    header = (f"# {name} ({ticker} — {exchange})\n"
+                              f"## Research — {ts} UTC\n\n")
+                    write_cache(stock, header + writeup)
+                    research_results[key] = {
+                        "action": "full",
+                        "writeup": writeup,
+                        "pass3_text": "",
+                        "pass2_triggered": p2_triggered,
+                        "error": False,
+                    }
+                else:
+                    p3, usage = run_update_research(client, stock, args.delay)
+
+                    # Append dated update block to cache
+                    today = utc_now().strftime("%Y-%m-%d")
+                    update_block = f"### Update — {today} UTC\n\n{p3}"
+                    append_cache_update(stock, update_block)
+
+                    # Output uses cached write-up body + new Pass 3 as update
+                    cached_body = strip_cache_header(cached)
+                    research_results[key] = {
+                        "action": "update",
+                        "writeup": cached_body,
+                        "pass3_text": p3,
+                        "pass2_triggered": False,
+                        "error": False,
+                    }
+
+                add_usage(total_usage, usage)
+
+            run_cost = calculate_cost(total_usage)
             succeeded += 1
-            print(f" done (${cost:.3f}, {usage['output_tokens']} tokens, {usage['search_requests']} searches)")
+            print(f"       Cost so far: ${run_cost:.2f}")
+
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             log_error(ticker, err_msg)
-            print(f" FAILED: {err_msg}")
+            print(f"       FAILED: {err_msg}")
             failed += 1
             failed_tickers.append(ticker)
-            research_results[key] = ""
+            research_results[key] = {
+                "action": action,
+                "writeup": f"*Research unavailable due to API error. Retry with: `--refresh {ticker}`*",
+                "pass3_text": "",
+                "pass2_triggered": False,
+                "error": True,
+            }
 
-        # Rate limiting
-        if i < total_to_process - 1:
+        # Delay between stocks (skip after last)
+        if i < total - 1 and not dry_run:
             time.sleep(args.delay)
 
-    # Update history with new snapshots
-    print(f"\nSaving rank snapshots to history...", end=" ", flush=True)
-    for key, stock in unique_stocks.items():
+    # ── Save history snapshots ────────────────────────────────────────────────
+    print(f"\nSaving rank history...", end=" ", flush=True)
+    for key, stock in stocks_list.items():
         add_snapshot(history, stock)
     save_history(history)
     print("done")
 
-    # Generate reports
-    print("Generating reports...", end=" ", flush=True)
-    output_files = generate_output_filenames()
-
-    generate_summary_file(
-        output_files["summary"], unique_stocks, tiers, research_results,
-        history, is_first_run, screen_name, prev_history
+    # ── Generate output file ──────────────────────────────────────────────────
+    print("Generating output file...", end=" ", flush=True)
+    output_path = generate_output_file(
+        stocks_list, tier1_keys, remaining_keys,
+        research_results, prev_history, is_first_run,
     )
-    generate_portfolio_file(
-        output_files["portfolio"], unique_stocks, research_results,
-        history, is_first_run, prev_history
-    )
-    generate_watchlist_file(
-        output_files["watchlist"], unique_stocks, tiers, research_results,
-        history, is_first_run, screen_name, prev_history
-    )
+    cleanup_old_outputs()
     print("done")
 
-    # Cleanup old outputs
-    cleanup_old_outputs()
-
-    # Final summary
+    # ── Final summary ─────────────────────────────────────────────────────────
     total_cost = calculate_cost(total_usage)
     print(f"\n{'=' * 60}")
     print(f"Run complete. {succeeded} succeeded, {failed} failed.")
     if failed_tickers:
-        print(f"Failed: {', '.join(failed_tickers)} — see {ERROR_LOG}")
-    if not dry_run:
-        print(f"Total cost: ${total_cost:.2f}")
-    else:
+        print(f"Failed tickers: {', '.join(failed_tickers)}")
+        print(f"Errors logged to: {ERROR_LOG}")
+    if dry_run:
         print("Total cost: $0.00 (dry run)")
-    print(f"\nReports saved:")
-    for label, path in output_files.items():
-        print(f"  {path}")
+    else:
+        print(f"Total cost: ${total_cost:.2f}")
+    print(f"Output: {output_path}")
     print(f"{'=' * 60}")
 
 
