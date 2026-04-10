@@ -303,7 +303,7 @@ def build_pass1_prompt(stock, prev, is_first_run):
         "You are a stock research analyst writing for a UK private investor. "
         "Write exclusively in flowing prose — absolutely no bullet points, numbered lists, or dashes. "
         "Every section must contain 2-4 sentences of specific, well-informed analysis. "
-        "Total across all eight items: approximately 400-500 words. "
+        "Total across all eight items: approximately 500-650 words. "
         "Always label currency as GBP or USD on any financial figure. "
         "Be balanced: give fair weight to both bull and bear considerations."
     )
@@ -322,7 +322,14 @@ Does the Quality Rank and Value Rank hold up against what is actually known abou
 What has happened at this company in the last 3-6 months? Earnings, guidance changes, management moves, contract wins, strategic shifts. What explains any rank movement?
 
 **3. Multibagger Potential**
-The bull case across three lenses: credible path to significantly higher revenue, margin expansion potential through operational leverage or pricing power, and re-rating potential if the stock is genuinely undervalued.
+
+Address each of the following three dimensions in order, with a clear sub-label for each:
+
+**a) Sales** — What is the revenue growth trajectory? How large is the addressable market, and is growth organic or acquisition-driven?
+
+**b) Margins** — What is the current margin profile? Where does operating leverage or pricing power create scope for expansion?
+
+**c) Valuation multiples** — What are the current multiples relative to history and sector peers? What re-rating potential exists if the quality and growth thesis plays out?
 
 **4. Bear Case**
 Two or three specific, credible risks for this company and sector right now. Not generic market risk — company-specific and sector-specific risks only.
@@ -335,6 +342,8 @@ Quick scan: unusual debt structures, cash flow concerns, recent dilution, off-ba
 
 **8. Final Assessment — Buy / Watch / Sell**
 One paragraph. The recommendation must be exactly one of: Buy, Watch, or Sell — no other labels. State it clearly in the first sentence with a brief rationale.
+
+Do not generate any section numbered 7. Your sections are numbered 1 through 6, then 8. Section 7 is reserved and will be inserted separately.
 
 Where your training knowledge is limited or confidence is low for sections 1, 2, or 3, include the exact phrase <<LOW CONFIDENCE>> somewhere in that section.
 
@@ -561,9 +570,26 @@ def insert_after_section3(text, supplement):
     return text.rstrip() + "\n\n" + supplement
 
 
+def _strip_model_section7(text):
+    """Remove any model-hallucinated section 7 from Pass 1 output.
+
+    Strips everything from a '**7.' header up to (but not including) the next
+    section header ('**8.' or similar) or end-of-text.
+    """
+    return re.sub(
+        r'\*\*7\..*?(?=\*\*[89]\.|$)',
+        '',
+        text,
+        flags=re.DOTALL,
+    ).strip()
+
+
 def assemble_full_writeup(pass1_clean, pass2_text, pass3_text):
     """Combine three passes into the final ordered 8-section write-up."""
     text = pass1_clean
+
+    # Strip any model-hallucinated section 7 before inserting the real one
+    text = _strip_model_section7(text)
 
     # Insert Pass 2 supplement after section 3, before section 4 (if it ran)
     if pass2_text.strip():
@@ -779,12 +805,52 @@ def generate_output_file(stocks_list, tier1_keys, remaining_keys,
         filename = now.strftime("%Y-%m-%d_%H%M") + "_2_analysis.md"
         filepath = OUTPUT_DIR / filename
 
+    # Build recommendations summary table
+    rec_groups = {"BUY": [], "WATCH": [], "SELL": []}
+    for key in tier1_keys + remaining_keys:
+        result = research_results.get(key, {})
+        if result.get("error"):
+            continue
+        stock = stocks_list[key]
+        rec = extract_recommendation(result.get("writeup", ""))
+        prev = None
+        if prev_history and key in prev_history:
+            snaps = prev_history[key].get("snapshots", [])
+            if snaps:
+                prev = snaps[-1]
+        delta = get_qv_delta(stock, prev)
+        if delta is not None:
+            sign = "+" if delta >= 0 else ""
+            delta_str = f"{sign}{delta}"
+        else:
+            delta_str = "—"
+        rec_groups[rec].append({
+            "name": stock["name"],
+            "ticker": stock["ticker"],
+            "qv_rank": stock["qv_rank"],
+            "qv_delta": delta_str,
+            "rec": rec.capitalize(),
+        })
+
+    table_lines = []
+    table_lines.append("| Stock | Ticker | QV Rank | QV Δ | Recommendation |")
+    table_lines.append("|-------|--------|---------|------|----------------|")
+    for group in ("BUY", "WATCH", "SELL"):
+        for entry in rec_groups[group]:
+            table_lines.append(
+                f"| {entry['name']} | {entry['ticker']} | {entry['qv_rank']} "
+                f"| {entry['qv_delta']} | {entry['rec']} |"
+            )
+    rec_table = "\n".join(table_lines)
+
     lines = [
         f"# Stock Analysis Report — {now.strftime('%d %B %Y')} {now.strftime('%H:%M')} UTC",
         "",
         "## Summary",
         "",
         generate_summary_prose(stocks_list, tier1_keys, prev_history, is_first_run),
+        "",
+        rec_table,
         "",
         "---",
         "",
